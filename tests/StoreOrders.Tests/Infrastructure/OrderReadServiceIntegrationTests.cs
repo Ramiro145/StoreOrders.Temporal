@@ -10,6 +10,7 @@ using StoreOrders.Workflows.Configuration;
 
 namespace StoreOrders.Tests.Infrastructure;
 
+[Collection(IntegrationTestCollection.Name)]
 public sealed class OrderReadServiceIntegrationTests
 {
     private static readonly Guid OrderId =

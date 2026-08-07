@@ -96,4 +96,107 @@ public sealed class TemporalOrderWorkflowGateway(
                 exception);
         }
     }
+
+    public async Task<OrderRuntimeStatus> GetRuntimeStatusAsync(
+        Guid orderId,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var workflowId =
+            TemporalNames.OrderWorkflowId(orderId);
+
+        try
+        {
+            var handle =
+                temporalClient.GetWorkflowHandle<OrderWorkflow>(
+                    workflowId);
+
+            return await handle.QueryAsync(
+                workflow => workflow.GetRuntimeStatus());
+        }
+        catch (RpcException exception)
+            when (exception.Code ==
+                  RpcException.StatusCode.NotFound)
+        {
+            throw new OrderWorkflowNotFoundException(
+                "Temporal no conoce un pedido con ese identificador.",
+                exception);
+        }
+        catch (Exception exception)
+            when (exception is RpcException or
+                  WorkflowQueryFailedException)
+        {
+            throw new OrderWorkflowUnavailableException(
+                "No fue posible consultar el estado interno del pedido.",
+                exception);
+        }
+    }
+
+    public async Task SignalPaymentConfirmedAsync(
+        Guid orderId,
+        PaymentConfirmedSignal signal,
+        CancellationToken cancellationToken = default)
+    {
+        await SignalAsync(
+            orderId,
+            workflow =>
+                workflow.PaymentConfirmedAsync(signal),
+            cancellationToken);
+    }
+
+    public async Task SignalPackingCompletedAsync(
+        Guid orderId,
+        PackingCompletedSignal signal,
+        CancellationToken cancellationToken = default)
+    {
+        await SignalAsync(
+            orderId,
+            workflow =>
+                workflow.PackingCompletedAsync(signal),
+            cancellationToken);
+    }
+
+    private async Task SignalAsync(
+        Guid orderId,
+        System.Linq.Expressions.Expression<
+            Func<OrderWorkflow, Task>> signal,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var workflowId =
+            TemporalNames.OrderWorkflowId(orderId);
+
+        try
+        {
+            var handle =
+                temporalClient.GetWorkflowHandle<OrderWorkflow>(
+                    workflowId);
+
+            await handle.SignalAsync(signal);
+        }
+        catch (RpcException exception)
+            when (exception.Code ==
+                  RpcException.StatusCode.NotFound)
+        {
+            throw new OrderWorkflowNotFoundException(
+                "Temporal no conoce un pedido activo con ese identificador.",
+                exception);
+        }
+        catch (RpcException exception)
+            when (exception.Code ==
+                  RpcException.StatusCode.FailedPrecondition)
+        {
+            throw new OrderWorkflowConflictException(
+                "El pedido ya terminó y no admite este evento.",
+                exception);
+        }
+        catch (RpcException exception)
+        {
+            throw new OrderWorkflowUnavailableException(
+                "No fue posible enviar el evento a Temporal.",
+                exception);
+        }
+    }
 }

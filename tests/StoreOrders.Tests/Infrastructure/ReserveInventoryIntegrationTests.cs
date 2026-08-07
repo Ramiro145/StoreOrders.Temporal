@@ -8,6 +8,7 @@ using StoreOrders.Infrastructure.Persistence;
 
 namespace StoreOrders.Tests.Infrastructure;
 
+[Collection(IntegrationTestCollection.Name)]
 public sealed class ReserveInventoryIntegrationTests
 {
     private static readonly Guid SuccessfulOrderId =

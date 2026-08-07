@@ -101,4 +101,51 @@ public static class OrderContractMapper
             model.CreatedAtUtc,
             model.UpdatedAtUtc);
     }
+
+    public static OrderRuntimeStatusResponse ToResponse(
+        OrderRuntimeStatus status)
+    {
+        return new OrderRuntimeStatusResponse(
+            status.OrderId,
+            status.WorkflowId,
+            status.Stage.ToString(),
+            status.WaitingFor.ToString(),
+            status.PaymentReceived,
+            status.PackingCompleted,
+            status.DeliveryStarted,
+            status.CanChangeAddress,
+            status.CanCancel);
+    }
+
+    public static PaymentConfirmedSignal ToSignal(
+        PaymentConfirmedRequest request)
+    {
+        return new PaymentConfirmedSignal(
+            request.EventId,
+            request.ExternalPaymentReference,
+            request.Amount,
+            request.Currency,
+            request.ConfirmedAtUtc.UtcDateTime);
+    }
+
+    public static PackingCompletedSignal ToSignal(
+        PackingCompletedRequest request)
+    {
+        return new PackingCompletedSignal(
+            request.EventId,
+            request.PackedBy,
+            request.PackedAtUtc.UtcDateTime);
+    }
+
+    public static WorkflowEventAcceptedResponse ToAcceptedResponse(
+        Guid orderId,
+        Guid eventId,
+        string message)
+    {
+        return new WorkflowEventAcceptedResponse(
+            orderId,
+            eventId,
+            "Accepted",
+            message);
+    }
 }

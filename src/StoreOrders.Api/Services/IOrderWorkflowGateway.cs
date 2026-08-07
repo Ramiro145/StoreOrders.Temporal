@@ -11,6 +11,20 @@ public interface IOrderWorkflowGateway
     Task<bool> ExistsAsync(
         Guid orderId,
         CancellationToken cancellationToken = default);
+
+    Task<OrderRuntimeStatus> GetRuntimeStatusAsync(
+        Guid orderId,
+        CancellationToken cancellationToken = default);
+
+    Task SignalPaymentConfirmedAsync(
+        Guid orderId,
+        PaymentConfirmedSignal signal,
+        CancellationToken cancellationToken = default);
+
+    Task SignalPackingCompletedAsync(
+        Guid orderId,
+        PackingCompletedSignal signal,
+        CancellationToken cancellationToken = default);
 }
 
 public sealed record StartOrderWorkflowResult(

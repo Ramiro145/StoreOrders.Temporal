@@ -9,3 +9,8 @@ public sealed class OrderWorkflowConflictException(
     string message,
     Exception innerException)
     : Exception(message, innerException);
+
+public sealed class OrderWorkflowNotFoundException(
+    string message,
+    Exception innerException)
+    : Exception(message, innerException);

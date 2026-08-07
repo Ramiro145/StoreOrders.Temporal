@@ -336,6 +336,393 @@ public sealed class EfOrderOperations(
             ReserveInventoryOutcome.Reserved,
             null);
     }
+
+    public async Task<ConfirmPaymentResult> ConfirmPaymentAsync(
+        ConfirmPaymentInput input,
+        CancellationToken cancellationToken = default)
+    {
+        ValidatePaymentInput(input);
+
+        var operationKey =
+            $"order:{input.OrderId:D}:payment:{input.EventId:D}";
+
+        var externalReference =
+            input.ExternalPaymentReference.Trim();
+
+        var currency =
+            input.Currency.Trim().ToUpperInvariant();
+
+        await using var transaction =
+            await dbContext.Database.BeginTransactionAsync(
+                System.Data.IsolationLevel.Serializable,
+                cancellationToken);
+
+        var order = await dbContext.Orders
+            .AsNoTracking()
+            .Include(current => current.Payment)
+            .SingleOrDefaultAsync(
+                current => current.OrderId == input.OrderId,
+                cancellationToken)
+            ?? throw new InvalidOperationException(
+                $"No existe el pedido {input.OrderId:D}.");
+
+        if (order.Payment is not null)
+        {
+            var outcome = PaymentMatches(
+                    order.Payment,
+                    externalReference,
+                    input.Amount,
+                    currency)
+                ? ConfirmPaymentOutcome.AlreadyConfirmed
+                : ConfirmPaymentOutcome.OrderNotPayable;
+
+            await transaction.CommitAsync(cancellationToken);
+
+            return new ConfirmPaymentResult(
+                order.OrderId,
+                order.Status,
+                outcome);
+        }
+
+        var existingPayment = await dbContext.Payments
+            .AsNoTracking()
+            .FirstOrDefaultAsync(
+                payment =>
+                    payment.OperationKey == operationKey ||
+                    payment.ExternalPaymentReference ==
+                        externalReference,
+                cancellationToken);
+
+        if (existingPayment is not null)
+        {
+            var samePayment =
+                existingPayment.OrderId == order.OrderId &&
+                PaymentMatches(
+                    existingPayment,
+                    externalReference,
+                    input.Amount,
+                    currency);
+
+            await transaction.CommitAsync(cancellationToken);
+
+            return new ConfirmPaymentResult(
+                order.OrderId,
+                order.Status,
+                samePayment
+                    ? ConfirmPaymentOutcome.AlreadyConfirmed
+                    : ConfirmPaymentOutcome.OrderNotPayable);
+        }
+
+        var previousAttempt = await dbContext.OrderHistory
+            .AsNoTracking()
+            .SingleOrDefaultAsync(
+                entry => entry.OperationKey == operationKey,
+                cancellationToken);
+
+        if (previousAttempt is not null)
+        {
+            var previousOutcome = previousAttempt.EventType switch
+            {
+                "PaymentRejectedAmount" =>
+                    ConfirmPaymentOutcome.RejectedAmount,
+                "PaymentRejectedCurrency" =>
+                    ConfirmPaymentOutcome.RejectedCurrency,
+                _ => ConfirmPaymentOutcome.OrderNotPayable
+            };
+
+            await transaction.CommitAsync(cancellationToken);
+
+            return new ConfirmPaymentResult(
+                order.OrderId,
+                order.Status,
+                previousOutcome);
+        }
+
+        if (order.Status != OrderStatus.AwaitingPayment)
+        {
+            await transaction.CommitAsync(cancellationToken);
+
+            return new ConfirmPaymentResult(
+                order.OrderId,
+                order.Status,
+                ConfirmPaymentOutcome.OrderNotPayable);
+        }
+
+        if (input.Amount != order.TotalAmount)
+        {
+            dbContext.OrderHistory.Add(
+                CreatePaymentRejectionHistory(
+                    order,
+                    operationKey,
+                    "PaymentRejectedAmount",
+                    "El importe informado no coincide con el total del pedido."));
+
+            await dbContext.SaveChangesAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+
+            return new ConfirmPaymentResult(
+                order.OrderId,
+                order.Status,
+                ConfirmPaymentOutcome.RejectedAmount);
+        }
+
+        if (!string.Equals(
+                currency,
+                order.Currency,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            dbContext.OrderHistory.Add(
+                CreatePaymentRejectionHistory(
+                    order,
+                    operationKey,
+                    "PaymentRejectedCurrency",
+                    "La moneda informada no coincide con la del pedido."));
+
+            await dbContext.SaveChangesAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+
+            return new ConfirmPaymentResult(
+                order.OrderId,
+                order.Status,
+                ConfirmPaymentOutcome.RejectedCurrency);
+        }
+
+        var nowUtc = DateTime.UtcNow;
+
+        var affectedOrders = await dbContext.Orders
+            .Where(current =>
+                current.OrderId == input.OrderId &&
+                current.Status == OrderStatus.AwaitingPayment)
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(
+                        current => current.Status,
+                        OrderStatus.Paid)
+                    .SetProperty(
+                        current => current.UpdatedAtUtc,
+                        nowUtc),
+                cancellationToken);
+
+        if (affectedOrders != 1)
+        {
+            await transaction.RollbackAsync(cancellationToken);
+
+            return new ConfirmPaymentResult(
+                order.OrderId,
+                order.Status,
+                ConfirmPaymentOutcome.OrderNotPayable);
+        }
+
+        dbContext.Payments.Add(new Payment
+        {
+            PaymentId = Guid.NewGuid(),
+            OrderId = order.OrderId,
+            ExternalPaymentReference = externalReference,
+            Amount = input.Amount,
+            Currency = currency,
+            Status = "Confirmed",
+            OperationKey = operationKey,
+            ConfirmedAtUtc = input.ConfirmedAtUtc,
+            CreatedAtUtc = nowUtc
+        });
+
+        dbContext.OrderHistory.Add(new OrderHistoryEntry
+        {
+            OrderId = order.OrderId,
+            EventType = "PaymentConfirmed",
+            PreviousStatus = OrderStatus.AwaitingPayment,
+            CurrentStatus = OrderStatus.Paid,
+            ActorType = ActorType.PaymentService,
+            Description = "Pago confirmado por el servicio externo.",
+            OperationKey = operationKey,
+            OccurredAtUtc = nowUtc
+        });
+
+        await dbContext.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+
+        return new ConfirmPaymentResult(
+            order.OrderId,
+            OrderStatus.Paid,
+            ConfirmPaymentOutcome.Confirmed);
+    }
+
+    public async Task<StartFulfillmentResult> StartFulfillmentAsync(
+        StartFulfillmentInput input,
+        CancellationToken cancellationToken = default)
+    {
+        if (input.OrderId == Guid.Empty)
+        {
+            throw new ArgumentException(
+                "OrderId no puede ser un GUID vacío.",
+                nameof(input));
+        }
+
+        await using var transaction =
+            await dbContext.Database.BeginTransactionAsync(
+                System.Data.IsolationLevel.Serializable,
+                cancellationToken);
+
+        var order = await dbContext.Orders
+            .AsNoTracking()
+            .Include(current => current.Fulfillment)
+            .SingleOrDefaultAsync(
+                current => current.OrderId == input.OrderId,
+                cancellationToken)
+            ?? throw new InvalidOperationException(
+                $"No existe el pedido {input.OrderId:D}.");
+
+        if (order.Fulfillment is not null)
+        {
+            await transaction.CommitAsync(cancellationToken);
+
+            return new StartFulfillmentResult(
+                order.OrderId,
+                order.Status,
+                StartFulfillmentOutcome.AlreadyStarted);
+        }
+
+        if (order.Status != OrderStatus.Paid)
+        {
+            await transaction.CommitAsync(cancellationToken);
+
+            return new StartFulfillmentResult(
+                order.OrderId,
+                order.Status,
+                StartFulfillmentOutcome.OrderNotReady);
+        }
+
+        var nowUtc = DateTime.UtcNow;
+
+        var affectedOrders = await dbContext.Orders
+            .Where(current =>
+                current.OrderId == input.OrderId &&
+                current.Status == OrderStatus.Paid)
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(
+                        current => current.Status,
+                        OrderStatus.Preparing)
+                    .SetProperty(
+                        current => current.UpdatedAtUtc,
+                        nowUtc),
+                cancellationToken);
+
+        if (affectedOrders != 1)
+        {
+            await transaction.RollbackAsync(cancellationToken);
+
+            return new StartFulfillmentResult(
+                order.OrderId,
+                order.Status,
+                StartFulfillmentOutcome.OrderNotReady);
+        }
+
+        dbContext.OrderFulfillments.Add(new OrderFulfillment
+        {
+            FulfillmentId = Guid.NewGuid(),
+            OrderId = order.OrderId,
+            Status = FulfillmentStatus.Preparing,
+            CreatedAtUtc = nowUtc
+        });
+
+        dbContext.OrderHistory.Add(new OrderHistoryEntry
+        {
+            OrderId = order.OrderId,
+            EventType = "FulfillmentStarted",
+            PreviousStatus = OrderStatus.Paid,
+            CurrentStatus = OrderStatus.Preparing,
+            ActorType = ActorType.System,
+            Description = "El pedido entró al proceso de preparación.",
+            OperationKey =
+                $"order:{order.OrderId:D}:fulfillment:start",
+            OccurredAtUtc = nowUtc
+        });
+
+        await dbContext.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+
+        return new StartFulfillmentResult(
+            order.OrderId,
+            OrderStatus.Preparing,
+            StartFulfillmentOutcome.Started);
+    }
+
+    public async Task<CompletePackingResult> CompletePackingAsync(
+        CompletePackingInput input,
+        CancellationToken cancellationToken = default)
+    {
+        ValidatePackingInput(input);
+
+        var operationKey =
+            $"order:{input.OrderId:D}:packing:{input.EventId:D}";
+
+        await using var transaction =
+            await dbContext.Database.BeginTransactionAsync(
+                System.Data.IsolationLevel.Serializable,
+                cancellationToken);
+
+        var order = await dbContext.Orders
+            .Include(current => current.Fulfillment)
+            .SingleOrDefaultAsync(
+                current => current.OrderId == input.OrderId,
+                cancellationToken)
+            ?? throw new InvalidOperationException(
+                $"No existe el pedido {input.OrderId:D}.");
+
+        if (order.Fulfillment?.Status == FulfillmentStatus.Packed)
+        {
+            await transaction.CommitAsync(cancellationToken);
+
+            return new CompletePackingResult(
+                order.OrderId,
+                order.Status,
+                CompletePackingOutcome.AlreadyPacked);
+        }
+
+        if (order.Status != OrderStatus.Preparing ||
+            order.Fulfillment?.Status != FulfillmentStatus.Preparing)
+        {
+            await transaction.CommitAsync(cancellationToken);
+
+            return new CompletePackingResult(
+                order.OrderId,
+                order.Status,
+                CompletePackingOutcome.OrderNotReady);
+        }
+
+        var nowUtc = DateTime.UtcNow;
+
+        order.Fulfillment.Status = FulfillmentStatus.Packed;
+        order.Fulfillment.PackedBy = input.PackedBy.Trim();
+        order.Fulfillment.PackedAtUtc = input.PackedAtUtc;
+        order.Fulfillment.OperationKey = operationKey;
+
+        order.Status = OrderStatus.ReadyForShipment;
+        order.UpdatedAtUtc = nowUtc;
+
+        dbContext.OrderHistory.Add(new OrderHistoryEntry
+        {
+            OrderId = order.OrderId,
+            EventType = "PackingCompleted",
+            PreviousStatus = OrderStatus.Preparing,
+            CurrentStatus = OrderStatus.ReadyForShipment,
+            ActorType = ActorType.Warehouse,
+            Description = "Almacén confirmó que el paquete está preparado.",
+            OperationKey = operationKey,
+            OccurredAtUtc = nowUtc,
+            Order = order
+        });
+
+        await dbContext.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+
+        return new CompletePackingResult(
+            order.OrderId,
+            order.Status,
+            CompletePackingOutcome.Packed);
+    }
+
     private static void ValidateInput(CreateOrderInput input)
     {
         if (input.OrderId == Guid.Empty)
@@ -469,6 +856,110 @@ public sealed class EfOrderOperations(
         return string.IsNullOrWhiteSpace(value)
             ? null
             : value.Trim();
+    }
+
+    private static void ValidatePaymentInput(
+        ConfirmPaymentInput input)
+    {
+        if (input.OrderId == Guid.Empty ||
+            input.EventId == Guid.Empty)
+        {
+            throw new ArgumentException(
+                "OrderId y EventId deben contener GUID válidos.",
+                nameof(input));
+        }
+
+        if (string.IsNullOrWhiteSpace(
+                input.ExternalPaymentReference))
+        {
+            throw new ArgumentException(
+                "ExternalPaymentReference es obligatorio.",
+                nameof(input));
+        }
+
+        if (input.Amount <= 0)
+        {
+            throw new ArgumentException(
+                "Amount debe ser mayor que cero.",
+                nameof(input));
+        }
+
+        if (string.IsNullOrWhiteSpace(input.Currency) ||
+            input.Currency.Trim().Length != 3)
+        {
+            throw new ArgumentException(
+                "Currency debe contener tres caracteres.",
+                nameof(input));
+        }
+
+        if (input.ConfirmedAtUtc == default)
+        {
+            throw new ArgumentException(
+                "ConfirmedAtUtc es obligatorio.",
+                nameof(input));
+        }
+    }
+
+    private static void ValidatePackingInput(
+        CompletePackingInput input)
+    {
+        if (input.OrderId == Guid.Empty ||
+            input.EventId == Guid.Empty)
+        {
+            throw new ArgumentException(
+                "OrderId y EventId deben contener GUID válidos.",
+                nameof(input));
+        }
+
+        if (string.IsNullOrWhiteSpace(input.PackedBy))
+        {
+            throw new ArgumentException(
+                "PackedBy es obligatorio.",
+                nameof(input));
+        }
+
+        if (input.PackedAtUtc == default)
+        {
+            throw new ArgumentException(
+                "PackedAtUtc es obligatorio.",
+                nameof(input));
+        }
+    }
+
+    private static bool PaymentMatches(
+        Payment payment,
+        string externalReference,
+        decimal amount,
+        string currency)
+    {
+        return string.Equals(
+                   payment.ExternalPaymentReference,
+                   externalReference,
+                   StringComparison.Ordinal) &&
+               payment.Amount == amount &&
+               string.Equals(
+                   payment.Currency,
+                   currency,
+                   StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static OrderHistoryEntry CreatePaymentRejectionHistory(
+        Order order,
+        string operationKey,
+        string eventType,
+        string description)
+    {
+        return new OrderHistoryEntry
+        {
+            OrderId = order.OrderId,
+            EventType = eventType,
+            PreviousStatus = OrderStatus.AwaitingPayment,
+            CurrentStatus = OrderStatus.AwaitingPayment,
+            ActorType = ActorType.PaymentService,
+            Description = description,
+            OperationKey = operationKey,
+            OccurredAtUtc = DateTime.UtcNow
+        };
     }
 
     private sealed record RequestedItem(

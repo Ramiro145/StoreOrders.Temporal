@@ -7,13 +7,15 @@ using StoreOrders.Workflows.Configuration;
 using StoreOrders.Workflows.Orders;
 using StoreOrders.Workflows.Orders.Contracts;
 using Temporalio.Client;
+using Temporalio.Exceptions;
 
 namespace StoreOrders.Tests.Workflows;
 
+[Collection(IntegrationTestCollection.Name)]
 public sealed class OrderWorkflowTemporalIntegrationTests
 {
     [Fact]
-    public async Task OrderWorkflow_ExecutesSuccessfulAndRejectedPaths()
+    public async Task OrderWorkflow_ProcessesQueriesEarlyAndDuplicateSignals()
     {
         var successfulOrderId = Guid.NewGuid();
         var rejectedOrderId = Guid.NewGuid();
@@ -30,9 +32,12 @@ public sealed class OrderWorkflowTemporalIntegrationTests
             await CleanupAsync(setupDbContext, testOrderIds);
         }
 
+        ITemporalClient? client = null;
+
         try
         {
             Dictionary<int, StockSnapshot> stockBefore;
+            decimal successfulTotal;
 
             await using (var snapshotDbContext = CreateDbContext())
             {
@@ -47,6 +52,11 @@ public sealed class OrderWorkflowTemporalIntegrationTests
                         stock => new StockSnapshot(
                             stock.AvailableQuantity,
                             stock.ReservedQuantity));
+
+                successfulTotal = await snapshotDbContext.Products
+                    .Where(product => product.ProductId == 2)
+                    .Select(product => product.CurrentPrice)
+                    .SingleAsync();
             }
 
             Assert.True(stockBefore[2].AvailableQuantity >= 1);
@@ -69,20 +79,93 @@ public sealed class OrderWorkflowTemporalIntegrationTests
                         unavailableQuantity)
                 ]);
 
-            var client = await TemporalClient.ConnectAsync(
+            client = await TemporalClient.ConnectAsync(
                 new("localhost:7233")
                 {
                     Namespace = "default"
                 });
 
-            var successfulResult =
-                await client.ExecuteWorkflowAsync(
+            var successfulHandle =
+                await client.StartWorkflowAsync(
                     (OrderWorkflow workflow) =>
                         workflow.RunAsync(successfulInput),
                     new(
                         id: TemporalNames.OrderWorkflowId(
                             successfulOrderId),
                         taskQueue: TemporalNames.TaskQueue));
+
+            var packingSignal = new PackingCompletedSignal(
+                Guid.NewGuid(),
+                "warehouse-test-user",
+                DateTime.UtcNow);
+
+            // Preparación anticipada y duplicada: debe permanecer en cola.
+            await successfulHandle.SignalAsync(
+                workflow =>
+                    workflow.PackingCompletedAsync(packingSignal));
+
+            await successfulHandle.SignalAsync(
+                workflow =>
+                    workflow.PackingCompletedAsync(packingSignal));
+
+            var rejectedPaymentSignal =
+                new PaymentConfirmedSignal(
+                    Guid.NewGuid(),
+                    $"PAY-REJECTED-{Guid.NewGuid():N}",
+                    successfulTotal + 1,
+                    "MXN",
+                    DateTime.UtcNow);
+
+            await successfulHandle.SignalAsync(
+                workflow =>
+                    workflow.PaymentConfirmedAsync(
+                        rejectedPaymentSignal));
+
+            var rejectedPaymentOperationKey =
+                $"order:{successfulOrderId:D}:payment:" +
+                $"{rejectedPaymentSignal.EventId:D}";
+
+            await WaitForHistoryAsync(
+                successfulOrderId,
+                rejectedPaymentOperationKey);
+
+            var awaitingPaymentStatus = await WaitForStageAsync(
+                successfulHandle,
+                OrderWorkflowStage.AwaitingPayment);
+
+            Assert.False(awaitingPaymentStatus.PaymentReceived);
+
+            var validPaymentSignal =
+                new PaymentConfirmedSignal(
+                    Guid.NewGuid(),
+                    $"PAY-{Guid.NewGuid():N}",
+                    successfulTotal,
+                    "MXN",
+                    DateTime.UtcNow);
+
+            // Pago válido y duplicado: SQL debe observar un solo efecto.
+            await successfulHandle.SignalAsync(
+                workflow =>
+                    workflow.PaymentConfirmedAsync(
+                        validPaymentSignal));
+
+            await successfulHandle.SignalAsync(
+                workflow =>
+                    workflow.PaymentConfirmedAsync(
+                        validPaymentSignal));
+
+            var readyStatus = await WaitForStageAsync(
+                successfulHandle,
+                OrderWorkflowStage.ReadyForShipment);
+
+            Assert.True(readyStatus.PaymentReceived);
+            Assert.True(readyStatus.PackingCompleted);
+            Assert.False(readyStatus.DeliveryStarted);
+            Assert.True(readyStatus.CanChangeAddress);
+            Assert.True(readyStatus.CanCancel);
+            Assert.Equal(
+                OrderWorkflowWaitingFor.ShipmentShipped,
+                readyStatus.WaitingFor);
 
             var rejectedResult =
                 await client.ExecuteWorkflowAsync(
@@ -92,10 +175,6 @@ public sealed class OrderWorkflowTemporalIntegrationTests
                         id: TemporalNames.OrderWorkflowId(
                             rejectedOrderId),
                         taskQueue: TemporalNames.TaskQueue));
-
-            Assert.Equal(
-                OrderStatus.AwaitingPayment,
-                successfulResult.Status);
 
             Assert.Equal(
                 OrderStatus.Rejected,
@@ -119,35 +198,52 @@ public sealed class OrderWorkflowTemporalIntegrationTests
                             order.OrderId == rejectedOrderId);
 
             Assert.Equal(
-                OrderStatus.AwaitingPayment,
+                OrderStatus.ReadyForShipment,
                 successfulOrder.Status);
 
             Assert.Equal(
                 OrderStatus.Rejected,
                 rejectedOrder.Status);
 
-            var successfulReservationCount =
-                await verificationDbContext
-                    .InventoryReservations
-                    .AsNoTracking()
+            Assert.Equal(
+                1,
+                await verificationDbContext.Payments
                     .CountAsync(
-                        reservation =>
-                            reservation.OrderItem.OrderId ==
-                            successfulOrderId &&
-                            reservation.Status ==
-                            ReservationStatus.Active);
+                        payment =>
+                            payment.OrderId ==
+                            successfulOrderId));
 
-            var rejectedReservationCount =
-                await verificationDbContext
-                    .InventoryReservations
+            var fulfillment =
+                await verificationDbContext.OrderFulfillments
                     .AsNoTracking()
-                    .CountAsync(
-                        reservation =>
-                            reservation.OrderItem.OrderId ==
-                            rejectedOrderId);
+                    .SingleAsync(
+                        current =>
+                            current.OrderId ==
+                            successfulOrderId);
 
-            Assert.Equal(1, successfulReservationCount);
-            Assert.Equal(0, rejectedReservationCount);
+            Assert.Equal(
+                FulfillmentStatus.Packed,
+                fulfillment.Status);
+
+            Assert.Equal(
+                packingSignal.EventId,
+                ExtractEventId(fulfillment.OperationKey));
+
+            Assert.Equal(
+                6,
+                await verificationDbContext.OrderHistory
+                    .CountAsync(
+                        entry =>
+                            entry.OrderId ==
+                            successfulOrderId));
+
+            Assert.Equal(
+                2,
+                await verificationDbContext.OrderHistory
+                    .CountAsync(
+                        entry =>
+                            entry.OrderId ==
+                            rejectedOrderId));
 
             var stockAfter =
                 await verificationDbContext.InventoryStocks
@@ -170,32 +266,101 @@ public sealed class OrderWorkflowTemporalIntegrationTests
                 stockBefore[2].ReservedQuantity + 1,
                 stockAfter[2].ReservedQuantity);
 
-            // El intento rechazado no debe afectar inventario.
             Assert.Equal(stockBefore[1], stockAfter[1]);
             Assert.Equal(stockBefore[3], stockAfter[3]);
-
-            Assert.Equal(
-                2,
-                await verificationDbContext.OrderHistory
-                    .CountAsync(
-                        entry =>
-                            entry.OrderId == successfulOrderId));
-
-            Assert.Equal(
-                2,
-                await verificationDbContext.OrderHistory
-                    .CountAsync(
-                        entry =>
-                            entry.OrderId == rejectedOrderId));
         }
         finally
         {
+            if (client is not null)
+            {
+                try
+                {
+                    await client
+                        .GetWorkflowHandle(
+                            TemporalNames.OrderWorkflowId(
+                                successfulOrderId))
+                        .TerminateAsync(
+                            "Limpieza de la prueba de integración.");
+                }
+                catch (RpcException exception)
+                    when (exception.Code ==
+                          RpcException.StatusCode.NotFound)
+                {
+                    // La ejecución no alcanzó a iniciar o ya no existe.
+                }
+            }
+
             await using var cleanupDbContext = CreateDbContext();
 
             await CleanupAsync(
                 cleanupDbContext,
                 testOrderIds);
         }
+    }
+
+    private static async Task<OrderRuntimeStatus> WaitForStageAsync(
+    WorkflowHandle<OrderWorkflow, OrderWorkflowResult> handle,
+    OrderWorkflowStage expectedStage)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(30);
+        OrderRuntimeStatus? lastStatus = null;
+
+        while (DateTime.UtcNow < deadline)
+        {
+            lastStatus = await handle.QueryAsync(
+                workflow => workflow.GetRuntimeStatus());
+
+            if (lastStatus.Stage == expectedStage)
+            {
+                return lastStatus;
+            }
+
+            await Task.Delay(200);
+        }
+
+        throw new TimeoutException(
+            $"El Workflow no alcanzó {expectedStage}. " +
+            $"Último estado: Stage={lastStatus?.Stage}, " +
+            $"WaitingFor={lastStatus?.WaitingFor}, " +
+            $"PaymentReceived={lastStatus?.PaymentReceived}, " +
+            $"PackingCompleted={lastStatus?.PackingCompleted}.");
+    }
+
+    private static async Task WaitForHistoryAsync(
+        Guid orderId,
+        string operationKey)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(30);
+
+        while (DateTime.UtcNow < deadline)
+        {
+            await using var dbContext = CreateDbContext();
+
+            if (await dbContext.OrderHistory
+                    .AsNoTracking()
+                    .AnyAsync(
+                        entry =>
+                            entry.OrderId == orderId &&
+                            entry.OperationKey ==
+                            operationKey))
+            {
+                return;
+            }
+
+            await Task.Delay(200);
+        }
+
+        throw new TimeoutException(
+            "No se registró el evento de pago rechazado.");
+    }
+
+    private static Guid ExtractEventId(string? operationKey)
+    {
+        Assert.False(string.IsNullOrWhiteSpace(operationKey));
+
+        return Guid.Parse(
+            operationKey!.Split(':', StringSplitOptions.RemoveEmptyEntries)
+                .Last());
     }
 
     private static StartOrderInput CreateInput(
@@ -293,6 +458,16 @@ public sealed class OrderWorkflowTemporalIntegrationTests
                             stock => stock.UpdatedAtUtc,
                             DateTime.UtcNow));
         }
+
+        await dbContext.Payments
+            .Where(payment =>
+                orderIds.Contains(payment.OrderId))
+            .ExecuteDeleteAsync();
+
+        await dbContext.OrderFulfillments
+            .Where(fulfillment =>
+                orderIds.Contains(fulfillment.OrderId))
+            .ExecuteDeleteAsync();
 
         await dbContext.InventoryReservations
             .Where(reservation =>

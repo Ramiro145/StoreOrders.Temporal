@@ -113,4 +113,172 @@ public sealed class OrdersController(
                     StatusCodes.Status503ServiceUnavailable);
         }
     }
+
+    [HttpGet("{orderId:guid}/runtime-status")]
+    public async Task<ActionResult<OrderRuntimeStatusResponse>>
+        GetRuntimeStatusAsync(
+            Guid orderId,
+            CancellationToken cancellationToken)
+    {
+        try
+        {
+            var status =
+                await workflowGateway.GetRuntimeStatusAsync(
+                    orderId,
+                    cancellationToken);
+
+            return Ok(OrderContractMapper.ToResponse(status));
+        }
+        catch (OrderWorkflowNotFoundException exception)
+        {
+            return NotFound(new ProblemDetails
+            {
+                Title = "Workflow no encontrado",
+                Detail = exception.Message,
+                Status = StatusCodes.Status404NotFound
+            });
+        }
+        catch (OrderWorkflowUnavailableException exception)
+        {
+            return Problem(
+                title: "Estado interno no disponible",
+                detail: exception.Message,
+                statusCode:
+                    StatusCodes.Status503ServiceUnavailable);
+        }
+    }
+
+    [HttpPost("{orderId:guid}/payment-confirmed")]
+    public async Task<ActionResult<WorkflowEventAcceptedResponse>>
+        ConfirmPaymentAsync(
+            Guid orderId,
+            [FromBody] PaymentConfirmedRequest request,
+            CancellationToken cancellationToken)
+    {
+        if (!ValidateEvent(
+                request.EventId,
+                request.ConfirmedAtUtc,
+                "confirmedAtUtc"))
+        {
+            return ValidationProblem(ModelState);
+        }
+
+        try
+        {
+            await workflowGateway.SignalPaymentConfirmedAsync(
+                orderId,
+                OrderContractMapper.ToSignal(request),
+                cancellationToken);
+
+            return Accepted(
+                OrderContractMapper.ToAcceptedResponse(
+                    orderId,
+                    request.EventId,
+                    "Temporal recibió la confirmación de pago."));
+        }
+        catch (OrderWorkflowNotFoundException exception)
+        {
+            return NotFound(new ProblemDetails
+            {
+                Title = "Workflow no encontrado",
+                Detail = exception.Message,
+                Status = StatusCodes.Status404NotFound
+            });
+        }
+        catch (OrderWorkflowConflictException exception)
+        {
+            return Conflict(new ProblemDetails
+            {
+                Title = "El pedido no admite pagos",
+                Detail = exception.Message,
+                Status = StatusCodes.Status409Conflict
+            });
+        }
+        catch (OrderWorkflowUnavailableException exception)
+        {
+            return Problem(
+                title: "Temporal no está disponible",
+                detail: exception.Message,
+                statusCode:
+                    StatusCodes.Status503ServiceUnavailable);
+        }
+    }
+
+    [HttpPost("{orderId:guid}/packing-completed")]
+    public async Task<ActionResult<WorkflowEventAcceptedResponse>>
+        CompletePackingAsync(
+            Guid orderId,
+            [FromBody] PackingCompletedRequest request,
+            CancellationToken cancellationToken)
+    {
+        if (!ValidateEvent(
+                request.EventId,
+                request.PackedAtUtc,
+                "packedAtUtc"))
+        {
+            return ValidationProblem(ModelState);
+        }
+
+        try
+        {
+            await workflowGateway.SignalPackingCompletedAsync(
+                orderId,
+                OrderContractMapper.ToSignal(request),
+                cancellationToken);
+
+            return Accepted(
+                OrderContractMapper.ToAcceptedResponse(
+                    orderId,
+                    request.EventId,
+                    "Temporal recibió la confirmación de preparación."));
+        }
+        catch (OrderWorkflowNotFoundException exception)
+        {
+            return NotFound(new ProblemDetails
+            {
+                Title = "Workflow no encontrado",
+                Detail = exception.Message,
+                Status = StatusCodes.Status404NotFound
+            });
+        }
+        catch (OrderWorkflowConflictException exception)
+        {
+            return Conflict(new ProblemDetails
+            {
+                Title = "El pedido no admite preparación",
+                Detail = exception.Message,
+                Status = StatusCodes.Status409Conflict
+            });
+        }
+        catch (OrderWorkflowUnavailableException exception)
+        {
+            return Problem(
+                title: "Temporal no está disponible",
+                detail: exception.Message,
+                statusCode:
+                    StatusCodes.Status503ServiceUnavailable);
+        }
+    }
+
+    private bool ValidateEvent(
+        Guid eventId,
+        DateTimeOffset occurredAtUtc,
+        string dateField)
+    {
+        if (eventId == Guid.Empty)
+        {
+            ModelState.AddModelError(
+                "eventId",
+                "EventId debe contener un GUID válido.");
+        }
+
+        if (occurredAtUtc == default)
+        {
+            ModelState.AddModelError(
+                dateField,
+                "La fecha del evento es obligatoria.");
+        }
+
+        return ModelState.IsValid;
+    }
 }

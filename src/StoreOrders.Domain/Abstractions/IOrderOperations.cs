@@ -12,4 +12,16 @@ public interface IOrderOperations
     Task<ReserveInventoryResult> ReserveInventoryAsync(
         ReserveInventoryInput input,
         CancellationToken cancellationToken = default);
+
+    Task<ConfirmPaymentResult> ConfirmPaymentAsync(
+        ConfirmPaymentInput input,
+        CancellationToken cancellationToken = default);
+
+    Task<StartFulfillmentResult> StartFulfillmentAsync(
+        StartFulfillmentInput input,
+        CancellationToken cancellationToken = default);
+
+    Task<CompletePackingResult> CompletePackingAsync(
+        CompletePackingInput input,
+        CancellationToken cancellationToken = default);
 }
