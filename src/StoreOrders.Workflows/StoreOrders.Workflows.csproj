@@ -4,6 +4,10 @@
     <ProjectReference Include="..\StoreOrders.Domain\StoreOrders.Domain.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <PackageReference Include="Temporalio" />
+  </ItemGroup>
+
   <PropertyGroup>
 
   </PropertyGroup>

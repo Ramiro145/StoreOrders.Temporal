@@ -1,0 +1,19 @@
+using StoreOrders.Domain.Abstractions;
+using StoreOrders.Domain.Operations.Inputs;
+using StoreOrders.Domain.Operations.Results;
+using Temporalio.Activities;
+
+namespace StoreOrders.Workflows.Activities;
+
+public sealed class OrderActivities(
+    IOrderOperations orderOperations)
+{
+    [Activity]
+    public async Task<CreateOrderResult> CreateOrderAsync(
+        CreateOrderInput input)
+    {
+        return await orderOperations.CreateOrderAsync(
+            input,
+            ActivityExecutionContext.Current.CancellationToken);
+    }
+}
