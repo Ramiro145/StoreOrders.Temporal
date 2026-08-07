@@ -5,6 +5,7 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Hosting" />
+    <PackageReference Include="Temporalio.Extensions.Hosting" />
   </ItemGroup>
 
   <ItemGroup>

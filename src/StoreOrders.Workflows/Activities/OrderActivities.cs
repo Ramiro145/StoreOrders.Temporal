@@ -16,4 +16,13 @@ public sealed class OrderActivities(
             input,
             ActivityExecutionContext.Current.CancellationToken);
     }
+
+    [Activity]
+    public async Task<ReserveInventoryResult> ReserveInventoryAsync(
+        ReserveInventoryInput input)
+    {
+        return await orderOperations.ReserveInventoryAsync(
+            input,
+            ActivityExecutionContext.Current.CancellationToken);
+    }
 }
