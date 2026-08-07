@@ -3,7 +3,7 @@ using Microsoft.Extensions.DependencyInjection;
 using StoreOrders.Domain.Abstractions;
 using StoreOrders.Infrastructure.Operations;
 using StoreOrders.Infrastructure.Persistence;
-
+using StoreOrders.Infrastructure.Queries;
 namespace StoreOrders.Infrastructure;
 
 public static class DependencyInjection
@@ -23,6 +23,7 @@ public static class DependencyInjection
             options => options.UseSqlServer(connectionString));
 
         services.AddScoped<IOrderOperations, EfOrderOperations>();
+        services.AddScoped<IOrderReadService, EfOrderReadService>();
 
         return services;
     }
