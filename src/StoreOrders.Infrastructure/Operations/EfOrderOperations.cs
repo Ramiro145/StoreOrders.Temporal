@@ -152,6 +152,190 @@ public sealed class EfOrderOperations(
         return ToResult(order, CreateOrderOutcome.Created);
     }
 
+    public async Task<ReserveInventoryResult> ReserveInventoryAsync(
+        ReserveInventoryInput input,
+        CancellationToken cancellationToken = default)
+    {
+        if (input.OrderId == Guid.Empty)
+        {
+            throw new ArgumentException(
+                "OrderId no puede ser un GUID vacío.",
+                nameof(input));
+        }
+
+        await using var transaction =
+            await dbContext.Database.BeginTransactionAsync(
+                System.Data.IsolationLevel.Serializable,
+                cancellationToken);
+
+        var order = await dbContext.Orders
+            .Include(current => current.Items)
+            .ThenInclude(item => item.InventoryReservation)
+            .SingleOrDefaultAsync(
+                current => current.OrderId == input.OrderId,
+                cancellationToken)
+            ?? throw new InvalidOperationException(
+                $"No existe el pedido {input.OrderId:D}.");
+
+        if (order.Items.Count == 0)
+        {
+            throw new InvalidOperationException(
+                "El pedido no contiene partidas para reservar.");
+        }
+
+        var existingReservations = order.Items
+            .Where(item => item.InventoryReservation is not null)
+            .Select(item => item.InventoryReservation!)
+            .ToArray();
+
+        var completeActiveReservation =
+            existingReservations.Length == order.Items.Count &&
+            existingReservations.All(
+                reservation =>
+                    reservation.Status == ReservationStatus.Active);
+
+        if (completeActiveReservation &&
+            order.Status == OrderStatus.AwaitingPayment)
+        {
+            await transaction.CommitAsync(cancellationToken);
+
+            return new ReserveInventoryResult(
+                order.OrderId,
+                order.Status,
+                ReserveInventoryOutcome.AlreadyReserved,
+                null);
+        }
+
+        if (existingReservations.Length > 0)
+        {
+            throw new InvalidOperationException(
+                "El pedido contiene una reservación parcial o incompatible.");
+        }
+
+        if (order.Status == OrderStatus.Rejected)
+        {
+            await transaction.CommitAsync(cancellationToken);
+
+            return new ReserveInventoryResult(
+                order.OrderId,
+                order.Status,
+                ReserveInventoryOutcome.InsufficientInventory,
+                null);
+        }
+
+        if (order.Status != OrderStatus.Received)
+        {
+            throw new InvalidOperationException(
+                $"El pedido está en estado {order.Status} y no puede reservarse.");
+        }
+
+        var nowUtc = DateTime.UtcNow;
+
+        await transaction.CreateSavepointAsync(
+            "BeforeInventoryChanges",
+            cancellationToken);
+
+        foreach (var item in order.Items.OrderBy(item => item.ProductId))
+        {
+            var affectedRows = await dbContext.InventoryStocks
+                .Where(stock =>
+                    stock.ProductId == item.ProductId &&
+                    stock.AvailableQuantity >= item.Quantity)
+                .ExecuteUpdateAsync(
+                    setters => setters
+                        .SetProperty(
+                            stock => stock.AvailableQuantity,
+                            stock =>
+                                stock.AvailableQuantity - item.Quantity)
+                        .SetProperty(
+                            stock => stock.ReservedQuantity,
+                            stock =>
+                                stock.ReservedQuantity + item.Quantity)
+                        .SetProperty(
+                            stock => stock.UpdatedAtUtc,
+                            nowUtc),
+                    cancellationToken);
+
+            if (affectedRows == 0)
+            {
+                await transaction.RollbackToSavepointAsync(
+                    "BeforeInventoryChanges",
+                    cancellationToken);
+
+                order.Status = OrderStatus.Rejected;
+                order.UpdatedAtUtc = nowUtc;
+
+                dbContext.OrderHistory.Add(new OrderHistoryEntry
+                {
+                    OrderId = order.OrderId,
+                    EventType = "InventoryRejected",
+                    PreviousStatus = OrderStatus.Received,
+                    CurrentStatus = OrderStatus.Rejected,
+                    ActorType = ActorType.System,
+                    Description =
+                        $"Inventario insuficiente para el producto " +
+                        $"{item.ProductId}.",
+                    OperationKey =
+                        $"order:{order.OrderId:D}:reserve",
+                    OccurredAtUtc = nowUtc,
+                    Order = order
+                });
+
+                await dbContext.SaveChangesAsync(cancellationToken);
+                await transaction.CommitAsync(cancellationToken);
+
+                return new ReserveInventoryResult(
+                    order.OrderId,
+                    order.Status,
+                    ReserveInventoryOutcome.InsufficientInventory,
+                    item.ProductId);
+            }
+        }
+
+        foreach (var item in order.Items)
+        {
+            dbContext.InventoryReservations.Add(
+                new InventoryReservation
+                {
+                    ReservationId = Guid.NewGuid(),
+                    OrderItemId = item.OrderItemId,
+                    Quantity = item.Quantity,
+                    Status = ReservationStatus.Active,
+                    OperationKey =
+                        $"order:{order.OrderId:D}:" +
+                        $"item:{item.OrderItemId:D}:reserve",
+                    CreatedAtUtc = nowUtc,
+                    OrderItem = item
+                });
+        }
+
+        order.Status = OrderStatus.AwaitingPayment;
+        order.UpdatedAtUtc = nowUtc;
+
+        dbContext.OrderHistory.Add(new OrderHistoryEntry
+        {
+            OrderId = order.OrderId,
+            EventType = "InventoryReserved",
+            PreviousStatus = OrderStatus.Received,
+            CurrentStatus = OrderStatus.AwaitingPayment,
+            ActorType = ActorType.System,
+            Description =
+                "Inventario reservado para todas las partidas.",
+            OperationKey =
+                $"order:{order.OrderId:D}:reserve",
+            OccurredAtUtc = nowUtc,
+            Order = order
+        });
+
+        await dbContext.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+
+        return new ReserveInventoryResult(
+            order.OrderId,
+            order.Status,
+            ReserveInventoryOutcome.Reserved,
+            null);
+    }
     private static void ValidateInput(CreateOrderInput input)
     {
         if (input.OrderId == Guid.Empty)
@@ -241,8 +425,43 @@ public sealed class EfOrderOperations(
 
     private static string BuildOrderNumber(Guid orderId)
     {
-        var value = $"ORD-{orderId:N}".ToUpperInvariant();
-        return value[..30];
+        const string alphabet =
+            "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+        Span<byte> bytes = stackalloc byte[16];
+        orderId.TryWriteBytes(bytes);
+
+        Span<char> encoded = stackalloc char[26];
+
+        uint buffer = 0;
+        var bitsInBuffer = 0;
+        var encodedIndex = 0;
+
+        foreach (var value in bytes)
+        {
+            buffer = (buffer << 8) | value;
+            bitsInBuffer += 8;
+
+            while (bitsInBuffer >= 5)
+            {
+                bitsInBuffer -= 5;
+
+                encoded[encodedIndex++] =
+                    alphabet[(int)((buffer >> bitsInBuffer) & 31)];
+            }
+
+            buffer = bitsInBuffer == 0
+                ? 0
+                : buffer & ((1u << bitsInBuffer) - 1);
+        }
+
+        if (bitsInBuffer > 0)
+        {
+            encoded[encodedIndex] =
+                alphabet[(int)((buffer << (5 - bitsInBuffer)) & 31)];
+        }
+
+        return $"ORD-{new string(encoded)}";
     }
 
     private static string? NormalizeOptional(string? value)
@@ -256,3 +475,4 @@ public sealed class EfOrderOperations(
         int ProductId,
         int Quantity);
 }
+
