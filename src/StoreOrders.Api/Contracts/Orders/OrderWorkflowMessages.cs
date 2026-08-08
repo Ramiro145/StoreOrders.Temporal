@@ -38,6 +38,37 @@ public sealed record PackingCompletedRequest(
 
     DateTimeOffset PackedAtUtc);
 
+public sealed record ChangeDeliveryAddressRequest(
+    Guid OperationId,
+
+    [Required, StringLength(150, MinimumLength = 1)]
+    string RecipientName,
+
+    [Required, StringLength(200, MinimumLength = 1)]
+    string Line1,
+
+    [StringLength(200)]
+    string? Line2,
+
+    [Required, StringLength(100, MinimumLength = 1)]
+    string City,
+
+    [Required, StringLength(100, MinimumLength = 1)]
+    string State,
+
+    [Required, StringLength(20, MinimumLength = 1)]
+    string PostalCode,
+
+    [Required, RegularExpression("^[A-Za-z]{2}$")]
+    string CountryCode);
+
+public sealed record ChangeDeliveryAddressResponse(
+    Guid OperationId,
+    Guid OrderId,
+    bool Accepted,
+    int AddressVersion,
+    string Message);
+
 public sealed record WorkflowEventAcceptedResponse(
     Guid OrderId,
     Guid EventId,

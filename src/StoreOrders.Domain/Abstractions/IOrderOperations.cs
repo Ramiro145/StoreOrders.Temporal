@@ -24,4 +24,8 @@ public interface IOrderOperations
     Task<CompletePackingResult> CompletePackingAsync(
         CompletePackingInput input,
         CancellationToken cancellationToken = default);
+
+    Task<ChangeDeliveryAddressResult> ChangeDeliveryAddressAsync(
+        ChangeDeliveryAddressInput input,
+        CancellationToken cancellationToken = default);
 }

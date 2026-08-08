@@ -13,6 +13,9 @@ public static class TemporalNames
     public const string PackingCompletedSignal =
         "PackingCompleted";
 
+    public const string ChangeDeliveryAddressUpdate =
+        "ChangeDeliveryAddress";
+
     public static string OrderWorkflowId(Guid orderId)
     {
         if (orderId == Guid.Empty)

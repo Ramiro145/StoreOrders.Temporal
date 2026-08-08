@@ -25,6 +25,11 @@ public interface IOrderWorkflowGateway
         Guid orderId,
         PackingCompletedSignal signal,
         CancellationToken cancellationToken = default);
+
+    Task<ChangeAddressUpdateResult> ChangeDeliveryAddressAsync(
+        Guid orderId,
+        ChangeAddressUpdate update,
+        CancellationToken cancellationToken = default);
 }
 
 public sealed record StartOrderWorkflowResult(

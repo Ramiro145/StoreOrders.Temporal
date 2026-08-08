@@ -723,6 +723,111 @@ public sealed class EfOrderOperations(
             CompletePackingOutcome.Packed);
     }
 
+    public async Task<ChangeDeliveryAddressResult>
+        ChangeDeliveryAddressAsync(
+            ChangeDeliveryAddressInput input,
+            CancellationToken cancellationToken = default)
+    {
+        ValidateAddressInput(input);
+
+        var operationKey =
+            $"order:{input.OrderId:D}:address:{input.OperationId:D}";
+
+        await using var transaction =
+            await dbContext.Database.BeginTransactionAsync(
+                System.Data.IsolationLevel.Serializable,
+                cancellationToken);
+
+        var order = await dbContext.Orders
+            .Include(current => current.Address)
+            .SingleOrDefaultAsync(
+                current => current.OrderId == input.OrderId,
+                cancellationToken)
+            ?? throw new InvalidOperationException(
+                $"No existe el pedido {input.OrderId:D}.");
+
+        if (order.Address is null)
+        {
+            throw new InvalidOperationException(
+                "El pedido no contiene una dirección de entrega.");
+        }
+
+        var previousAttempt = await dbContext.OrderHistory
+            .AsNoTracking()
+            .SingleOrDefaultAsync(
+                entry => entry.OperationKey == operationKey,
+                cancellationToken);
+
+        if (previousAttempt is not null)
+        {
+            if (previousAttempt.EventType !=
+                    "DeliveryAddressChanged" ||
+                !AddressMatches(order.Address, input))
+            {
+                throw new InvalidOperationException(
+                    "OperationId ya fue utilizado con otra dirección.");
+            }
+
+            await transaction.CommitAsync(cancellationToken);
+
+            return new ChangeDeliveryAddressResult(
+                order.OrderId,
+                order.Address.AddressVersion,
+                ChangeDeliveryAddressOutcome.AlreadyChanged,
+                "La dirección ya había sido actualizada.");
+        }
+
+        if (!AllowsAddressChange(order.Status))
+        {
+            await transaction.CommitAsync(cancellationToken);
+
+            return new ChangeDeliveryAddressResult(
+                order.OrderId,
+                order.Address.AddressVersion,
+                ChangeDeliveryAddressOutcome.NotAllowed,
+                AddressChangeRejectionMessage(order.Status));
+        }
+
+        var nowUtc = DateTime.UtcNow;
+
+        order.Address.RecipientName = input.RecipientName.Trim();
+        order.Address.Line1 = input.Line1.Trim();
+        order.Address.Line2 = NormalizeOptional(input.Line2);
+        order.Address.City = input.City.Trim();
+        order.Address.State = input.State.Trim();
+        order.Address.PostalCode = input.PostalCode.Trim();
+        order.Address.CountryCode =
+            input.CountryCode.Trim().ToUpperInvariant();
+        order.Address.AddressVersion++;
+        order.Address.UpdatedAtUtc = nowUtc;
+
+        order.UpdatedAtUtc = nowUtc;
+
+        dbContext.OrderHistory.Add(new OrderHistoryEntry
+        {
+            OrderId = order.OrderId,
+            EventType = "DeliveryAddressChanged",
+            PreviousStatus = order.Status,
+            CurrentStatus = order.Status,
+            ActorType = ActorType.Customer,
+            Description =
+                $"Dirección de entrega actualizada a la versión " +
+                $"{order.Address.AddressVersion}.",
+            OperationKey = operationKey,
+            OccurredAtUtc = nowUtc,
+            Order = order
+        });
+
+        await dbContext.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+
+        return new ChangeDeliveryAddressResult(
+            order.OrderId,
+            order.Address.AddressVersion,
+            ChangeDeliveryAddressOutcome.Changed,
+            "La dirección fue actualizada.");
+    }
+
     private static void ValidateInput(CreateOrderInput input)
     {
         if (input.OrderId == Guid.Empty)
@@ -924,6 +1029,127 @@ public sealed class EfOrderOperations(
                 "PackedAtUtc es obligatorio.",
                 nameof(input));
         }
+    }
+
+    private static void ValidateAddressInput(
+        ChangeDeliveryAddressInput input)
+    {
+        if (input.OrderId == Guid.Empty ||
+            input.OperationId == Guid.Empty)
+        {
+            throw new ArgumentException(
+                "OrderId y OperationId deben contener GUID válidos.",
+                nameof(input));
+        }
+
+        ValidateRequiredAddressText(
+            input.RecipientName,
+            150,
+            nameof(input.RecipientName));
+
+        ValidateRequiredAddressText(
+            input.Line1,
+            200,
+            nameof(input.Line1));
+
+        if (input.Line2?.Length > 200)
+        {
+            throw new ArgumentException(
+                "Line2 no puede exceder 200 caracteres.",
+                nameof(input));
+        }
+
+        ValidateRequiredAddressText(
+            input.City,
+            100,
+            nameof(input.City));
+
+        ValidateRequiredAddressText(
+            input.State,
+            100,
+            nameof(input.State));
+
+        ValidateRequiredAddressText(
+            input.PostalCode,
+            20,
+            nameof(input.PostalCode));
+
+        if (string.IsNullOrWhiteSpace(input.CountryCode) ||
+            input.CountryCode.Trim().Length != 2 ||
+            !input.CountryCode.Trim().All(char.IsLetter))
+        {
+            throw new ArgumentException(
+                "CountryCode debe contener dos letras.",
+                nameof(input));
+        }
+    }
+
+    private static void ValidateRequiredAddressText(
+        string value,
+        int maximumLength,
+        string propertyName)
+    {
+        if (string.IsNullOrWhiteSpace(value) ||
+            value.Length > maximumLength)
+        {
+            throw new ArgumentException(
+                $"{propertyName} es obligatorio y no puede exceder " +
+                $"{maximumLength} caracteres.",
+                propertyName);
+        }
+    }
+
+    private static bool AllowsAddressChange(OrderStatus status)
+    {
+        return status is
+            OrderStatus.Received or
+            OrderStatus.AwaitingPayment or
+            OrderStatus.Paid or
+            OrderStatus.Preparing or
+            OrderStatus.ReadyForShipment;
+    }
+
+    private static string AddressChangeRejectionMessage(
+        OrderStatus status)
+    {
+        return status == OrderStatus.Shipped
+            ? "El pedido ya fue enviado."
+            : $"El pedido está en estado {status} y no permite " +
+              "cambiar la dirección.";
+    }
+
+    private static bool AddressMatches(
+        OrderAddress address,
+        ChangeDeliveryAddressInput input)
+    {
+        return string.Equals(
+                   address.RecipientName,
+                   input.RecipientName.Trim(),
+                   StringComparison.Ordinal) &&
+               string.Equals(
+                   address.Line1,
+                   input.Line1.Trim(),
+                   StringComparison.Ordinal) &&
+               string.Equals(
+                   address.Line2,
+                   NormalizeOptional(input.Line2),
+                   StringComparison.Ordinal) &&
+               string.Equals(
+                   address.City,
+                   input.City.Trim(),
+                   StringComparison.Ordinal) &&
+               string.Equals(
+                   address.State,
+                   input.State.Trim(),
+                   StringComparison.Ordinal) &&
+               string.Equals(
+                   address.PostalCode,
+                   input.PostalCode.Trim(),
+                   StringComparison.Ordinal) &&
+               string.Equals(
+                   address.CountryCode,
+                   input.CountryCode.Trim(),
+                   StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool PaymentMatches(

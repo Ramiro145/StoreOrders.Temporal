@@ -260,6 +260,82 @@ public sealed class OrdersController(
         }
     }
 
+    [HttpPut("{orderId:guid}/delivery-address")]
+    public async Task<ActionResult<ChangeDeliveryAddressResponse>>
+        ChangeDeliveryAddressAsync(
+            Guid orderId,
+            [FromBody] ChangeDeliveryAddressRequest request,
+            CancellationToken cancellationToken)
+    {
+        if (request.OperationId == Guid.Empty)
+        {
+            ModelState.AddModelError(
+                "operationId",
+                "OperationId debe contener un GUID válido.");
+        }
+
+        if (!ModelState.IsValid)
+        {
+            return ValidationProblem(ModelState);
+        }
+
+        try
+        {
+            var result =
+                await workflowGateway.ChangeDeliveryAddressAsync(
+                    orderId,
+                    OrderContractMapper.ToUpdate(request),
+                    cancellationToken);
+
+            if (!result.Accepted)
+            {
+                var problem = new ProblemDetails
+                {
+                    Type =
+                        "https://storeorders.local/problems/" +
+                        "address-change-not-allowed",
+                    Title = "No se puede cambiar la dirección",
+                    Detail = result.Message,
+                    Status = StatusCodes.Status409Conflict
+                };
+
+                problem.Extensions["code"] =
+                    "address_change_not_allowed";
+                problem.Extensions["orderId"] = orderId;
+
+                return Conflict(problem);
+            }
+
+            return Ok(OrderContractMapper.ToResponse(result));
+        }
+        catch (OrderWorkflowNotFoundException exception)
+        {
+            return NotFound(new ProblemDetails
+            {
+                Title = "Workflow no encontrado",
+                Detail = exception.Message,
+                Status = StatusCodes.Status404NotFound
+            });
+        }
+        catch (OrderWorkflowConflictException exception)
+        {
+            return Conflict(new ProblemDetails
+            {
+                Title = "No se puede cambiar la dirección",
+                Detail = exception.Message,
+                Status = StatusCodes.Status409Conflict
+            });
+        }
+        catch (OrderWorkflowUnavailableException exception)
+        {
+            return Problem(
+                title: "Temporal no está disponible",
+                detail: exception.Message,
+                statusCode:
+                    StatusCodes.Status503ServiceUnavailable);
+        }
+    }
+
     private bool ValidateEvent(
         Guid eventId,
         DateTimeOffset occurredAtUtc,

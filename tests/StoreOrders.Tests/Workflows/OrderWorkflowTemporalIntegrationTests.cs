@@ -94,6 +94,57 @@ public sealed class OrderWorkflowTemporalIntegrationTests
                             successfulOrderId),
                         taskQueue: TemporalNames.TaskQueue));
 
+            var addressOperationId = Guid.NewGuid();
+
+            var addressUpdate = new ChangeAddressUpdate(
+                addressOperationId,
+                "Ramiro González",
+                "Av. Nueva 450",
+                "Interior 2",
+                "San Nicolás de los Garza",
+                "Nuevo León",
+                "66400",
+                "MX");
+
+            var addressResult =
+                await successfulHandle.ExecuteUpdateAsync(
+                    workflow =>
+                        workflow.ChangeDeliveryAddressAsync(
+                            addressUpdate),
+                    new WorkflowUpdateOptions
+                    {
+                        Id = addressOperationId.ToString("D")
+                    });
+
+            var duplicateAddressResult =
+                await successfulHandle.ExecuteUpdateAsync(
+                    workflow =>
+                        workflow.ChangeDeliveryAddressAsync(
+                            addressUpdate),
+                    new WorkflowUpdateOptions
+                    {
+                        Id = addressOperationId.ToString("D")
+                    });
+
+            Assert.True(addressResult.Accepted);
+            Assert.Equal(2, addressResult.AddressVersion);
+            Assert.Equal(addressResult, duplicateAddressResult);
+
+            var invalidAddressUpdate = addressUpdate with
+            {
+                OperationId = Guid.Empty
+            };
+
+            await Assert.ThrowsAsync<WorkflowUpdateFailedException>(
+                () => successfulHandle.ExecuteUpdateAsync(
+                    workflow =>
+                        workflow.ChangeDeliveryAddressAsync(
+                            invalidAddressUpdate),
+                    new WorkflowUpdateOptions
+                    {
+                        Id = Guid.NewGuid().ToString("D")
+                    }));
+
             var packingSignal = new PackingCompletedSignal(
                 Guid.NewGuid(),
                 "warehouse-test-user",
@@ -230,12 +281,24 @@ public sealed class OrderWorkflowTemporalIntegrationTests
                 ExtractEventId(fulfillment.OperationKey));
 
             Assert.Equal(
-                6,
+                7,
                 await verificationDbContext.OrderHistory
                     .CountAsync(
                         entry =>
                             entry.OrderId ==
                             successfulOrderId));
+
+            var updatedAddress =
+                await verificationDbContext.OrderAddresses
+                    .AsNoTracking()
+                    .SingleAsync(
+                        address =>
+                            address.OrderId ==
+                            successfulOrderId);
+
+            Assert.Equal("Av. Nueva 450", updatedAddress.Line1);
+            Assert.Equal("Interior 2", updatedAddress.Line2);
+            Assert.Equal(2, updatedAddress.AddressVersion);
 
             Assert.Equal(
                 2,
@@ -299,31 +362,26 @@ public sealed class OrderWorkflowTemporalIntegrationTests
     }
 
     private static async Task<OrderRuntimeStatus> WaitForStageAsync(
-    WorkflowHandle<OrderWorkflow, OrderWorkflowResult> handle,
-    OrderWorkflowStage expectedStage)
+        WorkflowHandle<OrderWorkflow, OrderWorkflowResult> handle,
+        OrderWorkflowStage expectedStage)
     {
         var deadline = DateTime.UtcNow.AddSeconds(30);
-        OrderRuntimeStatus? lastStatus = null;
 
         while (DateTime.UtcNow < deadline)
         {
-            lastStatus = await handle.QueryAsync(
+            var status = await handle.QueryAsync(
                 workflow => workflow.GetRuntimeStatus());
 
-            if (lastStatus.Stage == expectedStage)
+            if (status.Stage == expectedStage)
             {
-                return lastStatus;
+                return status;
             }
 
             await Task.Delay(200);
         }
 
         throw new TimeoutException(
-            $"El Workflow no alcanzó {expectedStage}. " +
-            $"Último estado: Stage={lastStatus?.Stage}, " +
-            $"WaitingFor={lastStatus?.WaitingFor}, " +
-            $"PaymentReceived={lastStatus?.PaymentReceived}, " +
-            $"PackingCompleted={lastStatus?.PackingCompleted}.");
+            $"El Workflow no alcanzó la etapa {expectedStage}.");
     }
 
     private static async Task WaitForHistoryAsync(

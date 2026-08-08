@@ -137,6 +137,31 @@ public static class OrderContractMapper
             request.PackedAtUtc.UtcDateTime);
     }
 
+    public static ChangeAddressUpdate ToUpdate(
+        ChangeDeliveryAddressRequest request)
+    {
+        return new ChangeAddressUpdate(
+            request.OperationId,
+            request.RecipientName,
+            request.Line1,
+            request.Line2,
+            request.City,
+            request.State,
+            request.PostalCode,
+            request.CountryCode);
+    }
+
+    public static ChangeDeliveryAddressResponse ToResponse(
+        ChangeAddressUpdateResult result)
+    {
+        return new ChangeDeliveryAddressResponse(
+            result.OperationId,
+            result.OrderId,
+            result.Accepted,
+            result.AddressVersion,
+            result.Message);
+    }
+
     public static WorkflowEventAcceptedResponse ToAcceptedResponse(
         Guid orderId,
         Guid eventId,

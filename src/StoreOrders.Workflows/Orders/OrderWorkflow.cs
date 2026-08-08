@@ -20,6 +20,7 @@ public sealed class OrderWorkflow
     private readonly Queue<PackingCompletedSignal> pendingPacking = [];
     private readonly HashSet<Guid> receivedPaymentEventIds = [];
     private readonly HashSet<Guid> receivedPackingEventIds = [];
+    private readonly Temporalio.Workflows.Mutex updateMutex = new();
 
     private OrderWorkflowStage stage =
         OrderWorkflowStage.Initializing;
@@ -30,6 +31,7 @@ public sealed class OrderWorkflow
     private bool paymentReceived;
     private bool packingCompleted;
     private bool deliveryStarted;
+    private bool orderCreated;
     private bool isTerminal;
 
     [WorkflowInit]
@@ -58,6 +60,8 @@ public sealed class OrderWorkflow
                 activities.CreateOrderAsync(
                     input.ToCreateOrderInput()),
             ActivityOptionsFactory.CreateDefault());
+
+        orderCreated = true;
 
         stage = OrderWorkflowStage.ReservingInventory;
         waitingFor =
@@ -174,6 +178,95 @@ public sealed class OrderWorkflow
         return Task.CompletedTask;
     }
 
+    [WorkflowUpdate(TemporalNames.ChangeDeliveryAddressUpdate)]
+    public async Task<ChangeAddressUpdateResult>
+        ChangeDeliveryAddressAsync(ChangeAddressUpdate update)
+    {
+        await Workflow.WaitConditionAsync(
+            () => orderCreated || isTerminal);
+
+        await updateMutex.WaitOneAsync();
+
+        try
+        {
+            var result = await Workflow.ExecuteActivityAsync(
+                (OrderActivities activities) =>
+                    activities.ChangeDeliveryAddressAsync(
+                        update.ToInput(orderId)),
+                ActivityOptionsFactory.CreateDefault());
+
+            return new ChangeAddressUpdateResult(
+                update.OperationId,
+                result.OrderId,
+                result.Outcome is not
+                    ChangeDeliveryAddressOutcome.NotAllowed,
+                result.AddressVersion,
+                result.Message);
+        }
+        finally
+        {
+            updateMutex.ReleaseMutex();
+        }
+    }
+
+    [WorkflowUpdateValidator(nameof(ChangeDeliveryAddressAsync))]
+    public void ValidateChangeDeliveryAddress(
+        ChangeAddressUpdate update)
+    {
+        if (update is null)
+        {
+            throw new ArgumentNullException(nameof(update));
+        }
+
+        if (update.OperationId == Guid.Empty)
+        {
+            throw new ArgumentException(
+                "OperationId debe contener un GUID válido.",
+                nameof(update));
+        }
+
+        ValidateRequiredText(
+            update.RecipientName,
+            150,
+            nameof(update.RecipientName));
+
+        ValidateRequiredText(
+            update.Line1,
+            200,
+            nameof(update.Line1));
+
+        if (update.Line2?.Length > 200)
+        {
+            throw new ArgumentException(
+                "Line2 no puede exceder 200 caracteres.",
+                nameof(update));
+        }
+
+        ValidateRequiredText(
+            update.City,
+            100,
+            nameof(update.City));
+
+        ValidateRequiredText(
+            update.State,
+            100,
+            nameof(update.State));
+
+        ValidateRequiredText(
+            update.PostalCode,
+            20,
+            nameof(update.PostalCode));
+
+        if (string.IsNullOrWhiteSpace(update.CountryCode) ||
+            update.CountryCode.Trim().Length != 2 ||
+            !update.CountryCode.Trim().All(char.IsLetter))
+        {
+            throw new ArgumentException(
+                "CountryCode debe contener dos letras.",
+                nameof(update));
+        }
+    }
+
     private async Task ProcessPaymentsAsync()
     {
         while (!paymentReceived)
@@ -271,5 +364,20 @@ public sealed class OrderWorkflow
             _ => throw new InvalidOperationException(
                 $"La etapa {stage} no es terminal.")
         };
+    }
+
+    private static void ValidateRequiredText(
+        string value,
+        int maximumLength,
+        string propertyName)
+    {
+        if (string.IsNullOrWhiteSpace(value) ||
+            value.Length > maximumLength)
+        {
+            throw new ArgumentException(
+                $"{propertyName} es obligatorio y no puede exceder " +
+                $"{maximumLength} caracteres.",
+                propertyName);
+        }
     }
 }

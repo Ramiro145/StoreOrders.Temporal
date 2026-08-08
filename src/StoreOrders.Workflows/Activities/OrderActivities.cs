@@ -52,4 +52,14 @@ public sealed class OrderActivities(
             input,
             ActivityExecutionContext.Current.CancellationToken);
     }
+
+    [Activity]
+    public async Task<ChangeDeliveryAddressResult>
+        ChangeDeliveryAddressAsync(
+            ChangeDeliveryAddressInput input)
+    {
+        return await orderOperations.ChangeDeliveryAddressAsync(
+            input,
+            ActivityExecutionContext.Current.CancellationToken);
+    }
 }

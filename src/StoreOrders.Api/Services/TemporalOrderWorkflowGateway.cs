@@ -157,6 +157,65 @@ public sealed class TemporalOrderWorkflowGateway(
             cancellationToken);
     }
 
+    public async Task<ChangeAddressUpdateResult>
+        ChangeDeliveryAddressAsync(
+            Guid orderId,
+            ChangeAddressUpdate update,
+            CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var workflowId =
+            TemporalNames.OrderWorkflowId(orderId);
+
+        try
+        {
+            var handle =
+                temporalClient.GetWorkflowHandle<OrderWorkflow>(
+                    workflowId);
+
+            return await handle.ExecuteUpdateAsync(
+                workflow =>
+                    workflow.ChangeDeliveryAddressAsync(update),
+                new WorkflowUpdateOptions
+                {
+                    Id = update.OperationId.ToString("D"),
+                    Rpc = new()
+                    {
+                        CancellationToken = cancellationToken
+                    }
+                });
+        }
+        catch (RpcException exception)
+            when (exception.Code ==
+                  RpcException.StatusCode.NotFound)
+        {
+            throw new OrderWorkflowNotFoundException(
+                "Temporal no conoce un pedido activo con ese identificador.",
+                exception);
+        }
+        catch (RpcException exception)
+            when (exception.Code ==
+                  RpcException.StatusCode.FailedPrecondition)
+        {
+            throw new OrderWorkflowConflictException(
+                "El pedido ya terminó y no admite cambiar la dirección.",
+                exception);
+        }
+        catch (WorkflowUpdateFailedException exception)
+        {
+            throw new OrderWorkflowUnavailableException(
+                "No fue posible completar el cambio de dirección.",
+                exception);
+        }
+        catch (RpcException exception)
+        {
+            throw new OrderWorkflowUnavailableException(
+                "No fue posible enviar el cambio de dirección a Temporal.",
+                exception);
+        }
+    }
+
     private async Task SignalAsync(
         Guid orderId,
         System.Linq.Expressions.Expression<
