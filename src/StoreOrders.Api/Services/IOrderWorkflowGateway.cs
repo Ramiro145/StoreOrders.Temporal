@@ -30,6 +30,11 @@ public interface IOrderWorkflowGateway
         Guid orderId,
         ChangeAddressUpdate update,
         CancellationToken cancellationToken = default);
+
+    Task<CancelOrderUpdateResult> CancelOrderAsync(
+        Guid orderId,
+        CancelOrderUpdate update,
+        CancellationToken cancellationToken = default);
 }
 
 public sealed record StartOrderWorkflowResult(

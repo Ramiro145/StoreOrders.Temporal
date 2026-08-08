@@ -336,6 +336,80 @@ public sealed class OrdersController(
         }
     }
 
+    [HttpPost("{orderId:guid}/cancel")]
+    public async Task<ActionResult<CancelOrderResponse>> CancelOrderAsync(
+        Guid orderId,
+        [FromBody] CancelOrderRequest request,
+        CancellationToken cancellationToken)
+    {
+        if (request.OperationId == Guid.Empty)
+        {
+            ModelState.AddModelError(
+                "operationId",
+                "OperationId debe contener un GUID válido.");
+        }
+
+        if (!ModelState.IsValid)
+        {
+            return ValidationProblem(ModelState);
+        }
+
+        try
+        {
+            var result = await workflowGateway.CancelOrderAsync(
+                orderId,
+                OrderContractMapper.ToUpdate(request),
+                cancellationToken);
+
+            if (!result.Accepted)
+            {
+                var problem = new ProblemDetails
+                {
+                    Type =
+                        "https://storeorders.local/problems/" +
+                        "cancellation-not-allowed",
+                    Title = "No se puede cancelar el pedido",
+                    Detail = result.Message,
+                    Status = StatusCodes.Status409Conflict
+                };
+
+                problem.Extensions["code"] =
+                    "cancellation_not_allowed";
+                problem.Extensions["orderId"] = orderId;
+
+                return Conflict(problem);
+            }
+
+            return Ok(OrderContractMapper.ToResponse(result));
+        }
+        catch (OrderWorkflowNotFoundException exception)
+        {
+            return NotFound(new ProblemDetails
+            {
+                Title = "Workflow no encontrado",
+                Detail = exception.Message,
+                Status = StatusCodes.Status404NotFound
+            });
+        }
+        catch (OrderWorkflowConflictException exception)
+        {
+            return Conflict(new ProblemDetails
+            {
+                Title = "No se puede cancelar el pedido",
+                Detail = exception.Message,
+                Status = StatusCodes.Status409Conflict
+            });
+        }
+        catch (OrderWorkflowUnavailableException exception)
+        {
+            return Problem(
+                title: "Temporal no está disponible",
+                detail: exception.Message,
+                statusCode:
+                    StatusCodes.Status503ServiceUnavailable);
+        }
+    }
+
     private bool ValidateEvent(
         Guid eventId,
         DateTimeOffset occurredAtUtc,

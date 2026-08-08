@@ -69,6 +69,26 @@ public sealed record ChangeDeliveryAddressResponse(
     int AddressVersion,
     string Message);
 
+public sealed record CancelOrderRequest(
+    Guid OperationId,
+
+    [Required, StringLength(400, MinimumLength = 1)]
+    string Reason,
+
+    [Required, StringLength(30, MinimumLength = 1)]
+    [RegularExpression(
+        "(?i)^(System|Customer|PaymentService|Warehouse|DeliveryService)$")]
+    string RequestedBy);
+
+public sealed record CancelOrderResponse(
+    Guid OperationId,
+    Guid OrderId,
+    bool Accepted,
+    string PreviousStatus,
+    string CurrentStatus,
+    int ReleasedReservationCount,
+    string Message);
+
 public sealed record WorkflowEventAcceptedResponse(
     Guid OrderId,
     Guid EventId,

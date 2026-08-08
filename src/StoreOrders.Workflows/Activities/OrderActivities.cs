@@ -62,4 +62,13 @@ public sealed class OrderActivities(
             input,
             ActivityExecutionContext.Current.CancellationToken);
     }
+
+    [Activity]
+    public async Task<CancelOrderResult> CancelOrderAsync(
+        CancelOrderInput input)
+    {
+        return await orderOperations.CancelOrderAsync(
+            input,
+            ActivityExecutionContext.Current.CancellationToken);
+    }
 }

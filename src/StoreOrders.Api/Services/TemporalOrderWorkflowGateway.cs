@@ -216,6 +216,79 @@ public sealed class TemporalOrderWorkflowGateway(
         }
     }
 
+    public async Task<CancelOrderUpdateResult> CancelOrderAsync(
+        Guid orderId,
+        CancelOrderUpdate update,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var workflowId =
+            TemporalNames.OrderWorkflowId(orderId);
+
+        var handle =
+            temporalClient.GetWorkflowHandle<OrderWorkflow>(
+                workflowId);
+
+        try
+        {
+            return await handle.ExecuteUpdateAsync(
+                workflow => workflow.CancelOrderAsync(update),
+                new WorkflowUpdateOptions
+                {
+                    Id = update.OperationId.ToString("D"),
+                    Rpc = new()
+                    {
+                        CancellationToken = cancellationToken
+                    }
+                });
+        }
+        catch (RpcException exception)
+            when (exception.Code ==
+                  RpcException.StatusCode.NotFound)
+        {
+            throw new OrderWorkflowNotFoundException(
+                "Temporal no conoce un pedido activo con ese identificador.",
+                exception);
+        }
+        catch (RpcException exception)
+            when (exception.Code ==
+                  RpcException.StatusCode.FailedPrecondition)
+        {
+            try
+            {
+                return await handle
+                    .GetUpdateHandle<CancelOrderUpdateResult>(
+                        update.OperationId.ToString("D"))
+                    .GetResultAsync(new()
+                    {
+                        CancellationToken = cancellationToken
+                    });
+            }
+            catch (RpcException retrievalException)
+                when (retrievalException.Code is
+                      RpcException.StatusCode.NotFound or
+                      RpcException.StatusCode.FailedPrecondition)
+            {
+                throw new OrderWorkflowConflictException(
+                    "El pedido ya terminó y no admite cancelación.",
+                    exception);
+            }
+        }
+        catch (WorkflowUpdateFailedException exception)
+        {
+            throw new OrderWorkflowUnavailableException(
+                "No fue posible completar la cancelación.",
+                exception);
+        }
+        catch (RpcException exception)
+        {
+            throw new OrderWorkflowUnavailableException(
+                "No fue posible enviar la cancelación a Temporal.",
+                exception);
+        }
+    }
+
     private async Task SignalAsync(
         Guid orderId,
         System.Linq.Expressions.Expression<

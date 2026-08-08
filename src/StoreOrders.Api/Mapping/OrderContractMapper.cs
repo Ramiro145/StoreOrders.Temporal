@@ -162,6 +162,28 @@ public static class OrderContractMapper
             result.Message);
     }
 
+    public static CancelOrderUpdate ToUpdate(
+        CancelOrderRequest request)
+    {
+        return new CancelOrderUpdate(
+            request.OperationId,
+            request.Reason,
+            request.RequestedBy);
+    }
+
+    public static CancelOrderResponse ToResponse(
+        CancelOrderUpdateResult result)
+    {
+        return new CancelOrderResponse(
+            result.OperationId,
+            result.OrderId,
+            result.Accepted,
+            result.PreviousStatus.ToString(),
+            result.CurrentStatus.ToString(),
+            result.ReleasedReservationCount,
+            result.Message);
+    }
+
     public static WorkflowEventAcceptedResponse ToAcceptedResponse(
         Guid orderId,
         Guid eventId,

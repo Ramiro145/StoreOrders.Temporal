@@ -20,7 +20,7 @@ public sealed class OrderWorkflow
     private readonly Queue<PackingCompletedSignal> pendingPacking = [];
     private readonly HashSet<Guid> receivedPaymentEventIds = [];
     private readonly HashSet<Guid> receivedPackingEventIds = [];
-    private readonly Temporalio.Workflows.Mutex updateMutex = new();
+    private readonly Temporalio.Workflows.Mutex mutationMutex = new();
 
     private OrderWorkflowStage stage =
         OrderWorkflowStage.Initializing;
@@ -67,12 +67,37 @@ public sealed class OrderWorkflow
         waitingFor =
             OrderWorkflowWaitingFor.InventoryReservation;
 
-        var reservationResult =
-            await Workflow.ExecuteActivityAsync(
-                (OrderActivities activities) =>
-                    activities.ReserveInventoryAsync(
-                        new ReserveInventoryInput(orderId)),
-                ActivityOptionsFactory.CreateDefault());
+        ReserveInventoryResult? reservationResult = null;
+
+        await mutationMutex.WaitOneAsync();
+
+        try
+        {
+            if (!isTerminal)
+            {
+                reservationResult =
+                    await Workflow.ExecuteActivityAsync(
+                        (OrderActivities activities) =>
+                            activities.ReserveInventoryAsync(
+                                new ReserveInventoryInput(orderId)),
+                        ActivityOptionsFactory.CreateDefault());
+            }
+        }
+        finally
+        {
+            mutationMutex.ReleaseMutex();
+        }
+
+        if (isTerminal)
+        {
+            return await CompleteTerminalResultAsync();
+        }
+
+        if (reservationResult is null)
+        {
+            throw new InvalidOperationException(
+                "La reserva de inventario no produjo un resultado.");
+        }
 
         if (reservationResult.Outcome ==
             ReserveInventoryOutcome.InsufficientInventory)
@@ -81,13 +106,7 @@ public sealed class OrderWorkflow
             waitingFor = OrderWorkflowWaitingFor.None;
             isTerminal = true;
 
-            await Workflow.WaitConditionAsync(
-                () => Workflow.AllHandlersFinished);
-
-            return new OrderWorkflowResult(
-                orderId,
-                OrderStatus.Rejected,
-                "Pedido rechazado por inventario insuficiente.");
+            return await CompleteTerminalResultAsync();
         }
 
         if (reservationResult.Outcome is not
@@ -113,18 +132,29 @@ public sealed class OrderWorkflow
         }
 
         await ProcessPaymentsAsync();
+
+        if (isTerminal)
+        {
+            return await CompleteTerminalResultAsync();
+        }
+
         await StartFulfillmentAsync();
+
+        if (isTerminal)
+        {
+            return await CompleteTerminalResultAsync();
+        }
+
         await ProcessPackingAsync();
+
+        if (isTerminal)
+        {
+            return await CompleteTerminalResultAsync();
+        }
 
         // El Incremento 11 sustituirá esta espera por DeliveryWorkflow.
         await Workflow.WaitConditionAsync(() => isTerminal);
-        await Workflow.WaitConditionAsync(
-            () => Workflow.AllHandlersFinished);
-
-        return new OrderWorkflowResult(
-            orderId,
-            ToTerminalOrderStatus(),
-            "El proceso del pedido terminó.");
+        return await CompleteTerminalResultAsync();
     }
 
     [WorkflowQuery(TemporalNames.GetRuntimeStatusQuery)]
@@ -185,7 +215,7 @@ public sealed class OrderWorkflow
         await Workflow.WaitConditionAsync(
             () => orderCreated || isTerminal);
 
-        await updateMutex.WaitOneAsync();
+        await mutationMutex.WaitOneAsync();
 
         try
         {
@@ -205,7 +235,7 @@ public sealed class OrderWorkflow
         }
         finally
         {
-            updateMutex.ReleaseMutex();
+            mutationMutex.ReleaseMutex();
         }
     }
 
@@ -267,6 +297,87 @@ public sealed class OrderWorkflow
         }
     }
 
+    [WorkflowUpdate(TemporalNames.CancelOrderUpdate)]
+    public async Task<CancelOrderUpdateResult> CancelOrderAsync(
+        CancelOrderUpdate update)
+    {
+        await Workflow.WaitConditionAsync(
+            () => orderCreated || isTerminal);
+
+        await mutationMutex.WaitOneAsync();
+
+        try
+        {
+            var result = await Workflow.ExecuteActivityAsync(
+                (OrderActivities activities) =>
+                    activities.CancelOrderAsync(
+                        update.ToInput(orderId)),
+                ActivityOptionsFactory.CreateDefault());
+
+            var accepted = result.Outcome is
+                CancelOrderOutcome.Cancelled or
+                CancelOrderOutcome.AlreadyCancelled;
+
+            if (accepted)
+            {
+                stage = OrderWorkflowStage.Cancelled;
+                waitingFor = OrderWorkflowWaitingFor.None;
+                isTerminal = true;
+            }
+
+            return new CancelOrderUpdateResult(
+                update.OperationId,
+                result.OrderId,
+                accepted,
+                result.PreviousStatus,
+                result.CurrentStatus,
+                result.ReleasedReservationCount,
+                result.Message);
+        }
+        finally
+        {
+            mutationMutex.ReleaseMutex();
+        }
+    }
+
+    [WorkflowUpdateValidator(nameof(CancelOrderAsync))]
+    public void ValidateCancelOrder(CancelOrderUpdate update)
+    {
+        if (update is null)
+        {
+            throw new ArgumentNullException(nameof(update));
+        }
+
+        if (update.OperationId == Guid.Empty)
+        {
+            throw new ArgumentException(
+                "OperationId debe contener un GUID válido.",
+                nameof(update));
+        }
+
+        ValidateRequiredText(
+            update.Reason,
+            400,
+            nameof(update.Reason));
+
+        ValidateRequiredText(
+            update.RequestedBy,
+            30,
+            nameof(update.RequestedBy));
+
+        if (!Enum.TryParse<ActorType>(
+                update.RequestedBy.Trim(),
+                ignoreCase: true,
+                out var actor) ||
+            !Enum.IsDefined(actor))
+        {
+            throw new ArgumentException(
+                "RequestedBy debe ser System, Customer, " +
+                "PaymentService, Warehouse o DeliveryService.",
+                nameof(update));
+        }
+    }
+
     private async Task ProcessPaymentsAsync()
     {
         while (!paymentReceived)
@@ -289,37 +400,65 @@ public sealed class OrderWorkflow
             waitingFor =
                 OrderWorkflowWaitingFor.PaymentProcessing;
 
-            var result = await Workflow.ExecuteActivityAsync(
-                (OrderActivities activities) =>
-                    activities.ConfirmPaymentAsync(
-                        signal.ToInput(orderId)),
-                ActivityOptionsFactory.CreateDefault());
+            await mutationMutex.WaitOneAsync();
 
-            paymentReceived = result.Outcome is
-                ConfirmPaymentOutcome.Confirmed or
-                ConfirmPaymentOutcome.AlreadyConfirmed;
+            try
+            {
+                if (isTerminal)
+                {
+                    return;
+                }
+
+                var result = await Workflow.ExecuteActivityAsync(
+                    (OrderActivities activities) =>
+                        activities.ConfirmPaymentAsync(
+                            signal.ToInput(orderId)),
+                    ActivityOptionsFactory.CreateDefault());
+
+                paymentReceived = result.Outcome is
+                    ConfirmPaymentOutcome.Confirmed or
+                    ConfirmPaymentOutcome.AlreadyConfirmed;
+            }
+            finally
+            {
+                mutationMutex.ReleaseMutex();
+            }
         }
     }
 
     private async Task StartFulfillmentAsync()
     {
-        var result = await Workflow.ExecuteActivityAsync(
-            (OrderActivities activities) =>
-                activities.StartFulfillmentAsync(
-                    new StartFulfillmentInput(orderId)),
-            ActivityOptionsFactory.CreateDefault());
+        await mutationMutex.WaitOneAsync();
 
-        if (result.Outcome is not
-            (StartFulfillmentOutcome.Started or
-             StartFulfillmentOutcome.AlreadyStarted))
+        try
         {
-            throw new InvalidOperationException(
-                "El pago fue confirmado, pero no fue posible " +
-                "iniciar la preparación.");
-        }
+            if (isTerminal)
+            {
+                return;
+            }
 
-        stage = OrderWorkflowStage.Preparing;
-        waitingFor = OrderWorkflowWaitingFor.PackingCompleted;
+            var result = await Workflow.ExecuteActivityAsync(
+                (OrderActivities activities) =>
+                    activities.StartFulfillmentAsync(
+                        new StartFulfillmentInput(orderId)),
+                ActivityOptionsFactory.CreateDefault());
+
+            if (result.Outcome is not
+                (StartFulfillmentOutcome.Started or
+                 StartFulfillmentOutcome.AlreadyStarted))
+            {
+                throw new InvalidOperationException(
+                    "El pago fue confirmado, pero no fue posible " +
+                    "iniciar la preparación.");
+            }
+
+            stage = OrderWorkflowStage.Preparing;
+            waitingFor = OrderWorkflowWaitingFor.PackingCompleted;
+        }
+        finally
+        {
+            mutationMutex.ReleaseMutex();
+        }
     }
 
     private async Task ProcessPackingAsync()
@@ -336,19 +475,53 @@ public sealed class OrderWorkflow
 
             var signal = pendingPacking.Dequeue();
 
-            var result = await Workflow.ExecuteActivityAsync(
-                (OrderActivities activities) =>
-                    activities.CompletePackingAsync(
-                        signal.ToInput(orderId)),
-                ActivityOptionsFactory.CreateDefault());
+            await mutationMutex.WaitOneAsync();
 
-            packingCompleted = result.Outcome is
-                CompletePackingOutcome.Packed or
-                CompletePackingOutcome.AlreadyPacked;
+            try
+            {
+                if (isTerminal)
+                {
+                    return;
+                }
+
+                var result = await Workflow.ExecuteActivityAsync(
+                    (OrderActivities activities) =>
+                        activities.CompletePackingAsync(
+                            signal.ToInput(orderId)),
+                    ActivityOptionsFactory.CreateDefault());
+
+                packingCompleted = result.Outcome is
+                    CompletePackingOutcome.Packed or
+                    CompletePackingOutcome.AlreadyPacked;
+
+                if (packingCompleted)
+                {
+                    stage = OrderWorkflowStage.ReadyForShipment;
+                    waitingFor =
+                        OrderWorkflowWaitingFor.ShipmentShipped;
+                }
+            }
+            finally
+            {
+                mutationMutex.ReleaseMutex();
+            }
         }
+    }
 
-        stage = OrderWorkflowStage.ReadyForShipment;
-        waitingFor = OrderWorkflowWaitingFor.ShipmentShipped;
+    private async Task<OrderWorkflowResult>
+        CompleteTerminalResultAsync()
+    {
+        await Workflow.WaitConditionAsync(
+            () => Workflow.AllHandlersFinished);
+
+        return new OrderWorkflowResult(
+            orderId,
+            ToTerminalOrderStatus(),
+            stage == OrderWorkflowStage.Cancelled
+                ? "El pedido fue cancelado."
+                : stage == OrderWorkflowStage.Rejected
+                    ? "Pedido rechazado por inventario insuficiente."
+                    : "El proceso del pedido terminó.");
     }
 
     private OrderStatus ToTerminalOrderStatus()

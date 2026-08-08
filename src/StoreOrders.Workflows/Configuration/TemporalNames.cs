@@ -16,6 +16,9 @@ public static class TemporalNames
     public const string ChangeDeliveryAddressUpdate =
         "ChangeDeliveryAddress";
 
+    public const string CancelOrderUpdate =
+        "CancelOrder";
+
     public static string OrderWorkflowId(Guid orderId)
     {
         if (orderId == Guid.Empty)

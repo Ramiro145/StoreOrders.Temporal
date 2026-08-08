@@ -828,6 +828,187 @@ public sealed class EfOrderOperations(
             "La dirección fue actualizada.");
     }
 
+    public async Task<CancelOrderResult> CancelOrderAsync(
+        CancelOrderInput input,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateCancellationInput(input);
+
+        var operationKey =
+            $"order:{input.OrderId:D}:cancel:{input.OperationId:D}";
+
+        var requestedBy = ParseCancellationActor(input.RequestedBy);
+        var description = BuildCancellationDescription(
+            input.Reason,
+            requestedBy);
+
+        await using var transaction =
+            await dbContext.Database.BeginTransactionAsync(
+                System.Data.IsolationLevel.Serializable,
+                cancellationToken);
+
+        var order = await dbContext.Orders
+            .Include(current => current.Fulfillment)
+            .Include(current => current.Shipment)
+            .SingleOrDefaultAsync(
+                current => current.OrderId == input.OrderId,
+                cancellationToken)
+            ?? throw new InvalidOperationException(
+                $"No existe el pedido {input.OrderId:D}.");
+
+        var previousAttempt = await dbContext.OrderHistory
+            .AsNoTracking()
+            .SingleOrDefaultAsync(
+                entry => entry.OperationKey == operationKey,
+                cancellationToken);
+
+        if (previousAttempt is not null)
+        {
+            if (previousAttempt.EventType != "OrderCancelled" ||
+                previousAttempt.ActorType != requestedBy ||
+                !string.Equals(
+                    previousAttempt.Description,
+                    description,
+                    StringComparison.Ordinal) ||
+                previousAttempt.PreviousStatus is null)
+            {
+                throw new InvalidOperationException(
+                    "OperationId ya fue utilizado para otra cancelación.");
+            }
+
+            var releasedReservationCount =
+                await CountReleasedReservationsAsync(
+                    order.OrderId,
+                    cancellationToken);
+
+            await transaction.CommitAsync(cancellationToken);
+
+            return new CancelOrderResult(
+                order.OrderId,
+                previousAttempt.PreviousStatus.Value,
+                OrderStatus.Cancelled,
+                releasedReservationCount,
+                CancelOrderOutcome.AlreadyCancelled,
+                "El pedido fue cancelado y sus reservaciones fueron liberadas.");
+        }
+
+        if (order.Status == OrderStatus.Cancelled)
+        {
+            await transaction.CommitAsync(cancellationToken);
+
+            return new CancelOrderResult(
+                order.OrderId,
+                OrderStatus.Cancelled,
+                OrderStatus.Cancelled,
+                ReleasedReservationCount: 0,
+                CancelOrderOutcome.AlreadyCancelled,
+                "El pedido ya estaba cancelado.");
+        }
+
+        if (!AllowsCancellation(order))
+        {
+            await transaction.CommitAsync(cancellationToken);
+
+            return new CancelOrderResult(
+                order.OrderId,
+                order.Status,
+                order.Status,
+                ReleasedReservationCount: 0,
+                CancelOrderOutcome.NotAllowed,
+                CancellationRejectionMessage(order));
+        }
+
+        var activeReservations =
+            await dbContext.InventoryReservations
+                .Include(reservation => reservation.OrderItem)
+                .Where(reservation =>
+                    reservation.OrderItem.OrderId == order.OrderId &&
+                    reservation.Status == ReservationStatus.Active)
+                .ToArrayAsync(cancellationToken);
+
+        var nowUtc = DateTime.UtcNow;
+
+        foreach (var productReservations in activeReservations
+                     .GroupBy(reservation =>
+                         reservation.OrderItem.ProductId))
+        {
+            var quantity = productReservations.Sum(
+                reservation => reservation.Quantity);
+
+            var affectedStocks = await dbContext.InventoryStocks
+                .Where(stock =>
+                    stock.ProductId == productReservations.Key &&
+                    stock.ReservedQuantity >= quantity)
+                .ExecuteUpdateAsync(
+                    setters => setters
+                        .SetProperty(
+                            stock => stock.AvailableQuantity,
+                            stock =>
+                                stock.AvailableQuantity + quantity)
+                        .SetProperty(
+                            stock => stock.ReservedQuantity,
+                            stock =>
+                                stock.ReservedQuantity - quantity)
+                        .SetProperty(
+                            stock => stock.UpdatedAtUtc,
+                            nowUtc),
+                    cancellationToken);
+
+            if (affectedStocks != 1)
+            {
+                throw new InvalidOperationException(
+                    "El inventario reservado es incompatible con " +
+                    $"el producto {productReservations.Key}.");
+            }
+        }
+
+        foreach (var reservation in activeReservations)
+        {
+            reservation.Status = ReservationStatus.Released;
+            reservation.ReleasedAtUtc = nowUtc;
+        }
+
+        if (order.Fulfillment is not null)
+        {
+            order.Fulfillment.Status = FulfillmentStatus.Cancelled;
+        }
+
+        if (order.Shipment?.Status == ShipmentStatus.Pending)
+        {
+            order.Shipment.Status = ShipmentStatus.Cancelled;
+        }
+
+        var previousStatus = order.Status;
+
+        order.Status = OrderStatus.Cancelled;
+        order.CancelledAtUtc = nowUtc;
+        order.UpdatedAtUtc = nowUtc;
+
+        dbContext.OrderHistory.Add(new OrderHistoryEntry
+        {
+            OrderId = order.OrderId,
+            EventType = "OrderCancelled",
+            PreviousStatus = previousStatus,
+            CurrentStatus = OrderStatus.Cancelled,
+            ActorType = requestedBy,
+            Description = description,
+            OperationKey = operationKey,
+            OccurredAtUtc = nowUtc,
+            Order = order
+        });
+
+        await dbContext.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+
+        return new CancelOrderResult(
+            order.OrderId,
+            previousStatus,
+            OrderStatus.Cancelled,
+            activeReservations.Length,
+            CancelOrderOutcome.Cancelled,
+            "El pedido fue cancelado y sus reservaciones fueron liberadas.");
+    }
+
     private static void ValidateInput(CreateOrderInput input)
     {
         if (input.OrderId == Guid.Empty)
@@ -1084,6 +1265,37 @@ public sealed class EfOrderOperations(
         }
     }
 
+    private static void ValidateCancellationInput(
+        CancelOrderInput input)
+    {
+        if (input.OrderId == Guid.Empty ||
+            input.OperationId == Guid.Empty)
+        {
+            throw new ArgumentException(
+                "OrderId y OperationId deben contener GUID válidos.",
+                nameof(input));
+        }
+
+        if (string.IsNullOrWhiteSpace(input.Reason) ||
+            input.Reason.Length > 400)
+        {
+            throw new ArgumentException(
+                "Reason es obligatorio y no puede exceder 400 caracteres.",
+                nameof(input));
+        }
+
+        if (string.IsNullOrWhiteSpace(input.RequestedBy) ||
+            input.RequestedBy.Length > 30)
+        {
+            throw new ArgumentException(
+                "RequestedBy es obligatorio y no puede exceder " +
+                "30 caracteres.",
+                nameof(input));
+        }
+
+        _ = ParseCancellationActor(input.RequestedBy);
+    }
+
     private static void ValidateRequiredAddressText(
         string value,
         int maximumLength,
@@ -1150,6 +1362,83 @@ public sealed class EfOrderOperations(
                    address.CountryCode,
                    input.CountryCode.Trim(),
                    StringComparison.OrdinalIgnoreCase);
+    }
+
+    private async Task<int> CountReleasedReservationsAsync(
+        Guid orderId,
+        CancellationToken cancellationToken)
+    {
+        return await dbContext.InventoryReservations
+            .AsNoTracking()
+            .CountAsync(
+                reservation =>
+                    reservation.OrderItem.OrderId == orderId &&
+                    reservation.Status == ReservationStatus.Released,
+                cancellationToken);
+    }
+
+    private static bool AllowsCancellation(Order order)
+    {
+        var orderAllowsCancellation = order.Status is
+            OrderStatus.Received or
+            OrderStatus.AwaitingPayment or
+            OrderStatus.Paid or
+            OrderStatus.Preparing or
+            OrderStatus.ReadyForShipment;
+
+        var shipmentAllowsCancellation = order.Shipment is null ||
+            order.Shipment.Status is
+                ShipmentStatus.Pending or
+                ShipmentStatus.Cancelled;
+
+        return orderAllowsCancellation &&
+               shipmentAllowsCancellation;
+    }
+
+    private static string CancellationRejectionMessage(Order order)
+    {
+        if (order.Status == OrderStatus.Shipped ||
+            order.Shipment?.Status == ShipmentStatus.Shipped)
+        {
+            return "El pedido ya fue enviado.";
+        }
+
+        if (order.Status == OrderStatus.Delivered ||
+            order.Shipment?.Status == ShipmentStatus.Delivered)
+        {
+            return "El pedido ya fue entregado.";
+        }
+
+        return order.Status == OrderStatus.Rejected
+            ? "Un pedido rechazado no puede cancelarse."
+            : $"El pedido está en estado {order.Status} y no permite " +
+              "cancelación.";
+    }
+
+    private static ActorType ParseCancellationActor(
+        string requestedBy)
+    {
+        if (Enum.TryParse<ActorType>(
+                requestedBy.Trim(),
+                ignoreCase: true,
+                out var actor) &&
+            Enum.IsDefined(actor))
+        {
+            return actor;
+        }
+
+        throw new ArgumentException(
+            "RequestedBy debe ser System, Customer, PaymentService, " +
+            "Warehouse o DeliveryService.",
+            nameof(requestedBy));
+    }
+
+    private static string BuildCancellationDescription(
+        string reason,
+        ActorType requestedBy)
+    {
+        return $"Cancelación solicitada por {requestedBy}. " +
+               $"Motivo: {reason.Trim()}";
     }
 
     private static bool PaymentMatches(

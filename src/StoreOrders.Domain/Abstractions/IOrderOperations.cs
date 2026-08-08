@@ -28,4 +28,8 @@ public interface IOrderOperations
     Task<ChangeDeliveryAddressResult> ChangeDeliveryAddressAsync(
         ChangeDeliveryAddressInput input,
         CancellationToken cancellationToken = default);
+
+    Task<CancelOrderResult> CancelOrderAsync(
+        CancelOrderInput input,
+        CancellationToken cancellationToken = default);
 }

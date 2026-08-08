@@ -3,6 +3,7 @@ using StoreOrders.Api.Contracts.Orders;
 using StoreOrders.Api.Controllers;
 using StoreOrders.Api.Services;
 using StoreOrders.Domain.Abstractions;
+using StoreOrders.Domain.Enums;
 using StoreOrders.Domain.ReadModels;
 using StoreOrders.Workflows.Orders.Contracts;
 
@@ -75,12 +76,91 @@ public sealed class OrdersControllerTests
         Assert.Equal(orderId, problem.Extensions["orderId"]);
     }
 
+    [Fact]
+    public async Task CancelOrderAsync_Accepted_ReturnsOk()
+    {
+        var orderId = Guid.NewGuid();
+        var operationId = Guid.NewGuid();
+
+        var controller = CreateController(
+            new CancelOrderUpdateResult(
+                operationId,
+                orderId,
+                Accepted: true,
+                OrderStatus.AwaitingPayment,
+                OrderStatus.Cancelled,
+                ReleasedReservationCount: 2,
+                "El pedido fue cancelado y sus reservaciones " +
+                "fueron liberadas."));
+
+        var action = await controller.CancelOrderAsync(
+            orderId,
+            CreateCancelRequest(operationId),
+            CancellationToken.None);
+
+        var ok = Assert.IsType<OkObjectResult>(action.Result);
+        var response = Assert.IsType<CancelOrderResponse>(ok.Value);
+
+        Assert.True(response.Accepted);
+        Assert.Equal(orderId, response.OrderId);
+        Assert.Equal(operationId, response.OperationId);
+        Assert.Equal("AwaitingPayment", response.PreviousStatus);
+        Assert.Equal("Cancelled", response.CurrentStatus);
+        Assert.Equal(2, response.ReleasedReservationCount);
+    }
+
+    [Fact]
+    public async Task CancelOrderAsync_NotAllowed_ReturnsConflict()
+    {
+        var orderId = Guid.NewGuid();
+        var operationId = Guid.NewGuid();
+
+        var controller = CreateController(
+            new CancelOrderUpdateResult(
+                operationId,
+                orderId,
+                Accepted: false,
+                OrderStatus.Shipped,
+                OrderStatus.Shipped,
+                ReleasedReservationCount: 0,
+                "El pedido ya fue enviado."));
+
+        var action = await controller.CancelOrderAsync(
+            orderId,
+            CreateCancelRequest(operationId),
+            CancellationToken.None);
+
+        var conflict =
+            Assert.IsType<ConflictObjectResult>(action.Result);
+
+        var problem =
+            Assert.IsType<ProblemDetails>(conflict.Value);
+
+        Assert.Equal(409, problem.Status);
+        Assert.Equal(
+            "https://storeorders.local/problems/" +
+            "cancellation-not-allowed",
+            problem.Type);
+        Assert.Equal(
+            "cancellation_not_allowed",
+            problem.Extensions["code"]);
+        Assert.Equal(orderId, problem.Extensions["orderId"]);
+    }
+
     private static OrdersController CreateController(
         ChangeAddressUpdateResult result)
     {
         return new OrdersController(
             new UnusedOrderReadService(),
             new StaticWorkflowGateway(result));
+    }
+
+    private static OrdersController CreateController(
+        CancelOrderUpdateResult result)
+    {
+        return new OrdersController(
+            new UnusedOrderReadService(),
+            new StaticWorkflowGateway(cancelResult: result));
     }
 
     private static ChangeDeliveryAddressRequest CreateRequest(
@@ -97,6 +177,15 @@ public sealed class OrdersControllerTests
             "MX");
     }
 
+    private static CancelOrderRequest CreateCancelRequest(
+        Guid operationId)
+    {
+        return new CancelOrderRequest(
+            operationId,
+            "El cliente capturó productos incorrectos.",
+            "customer");
+    }
+
     private sealed class UnusedOrderReadService
         : IOrderReadService
     {
@@ -109,7 +198,8 @@ public sealed class OrdersControllerTests
     }
 
     private sealed class StaticWorkflowGateway(
-        ChangeAddressUpdateResult result)
+        ChangeAddressUpdateResult? addressResult = null,
+        CancelOrderUpdateResult? cancelResult = null)
         : IOrderWorkflowGateway
     {
         public Task<ChangeAddressUpdateResult>
@@ -118,7 +208,19 @@ public sealed class OrdersControllerTests
                 ChangeAddressUpdate update,
                 CancellationToken cancellationToken = default)
         {
-            return Task.FromResult(result);
+            return Task.FromResult(
+                addressResult ??
+                throw new NotSupportedException());
+        }
+
+        public Task<CancelOrderUpdateResult> CancelOrderAsync(
+            Guid orderId,
+            CancelOrderUpdate update,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult(
+                cancelResult ??
+                throw new NotSupportedException());
         }
 
         public Task<StartOrderWorkflowResult> StartAsync(

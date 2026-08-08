@@ -218,6 +218,44 @@ public sealed class OrderWorkflowTemporalIntegrationTests
                 OrderWorkflowWaitingFor.ShipmentShipped,
                 readyStatus.WaitingFor);
 
+            var cancelOperationId = Guid.NewGuid();
+            var cancelUpdate = new CancelOrderUpdate(
+                cancelOperationId,
+                "El cliente capturó productos incorrectos.",
+                "customer");
+
+            var cancelResult =
+                await successfulHandle.ExecuteUpdateAsync(
+                    workflow =>
+                        workflow.CancelOrderAsync(cancelUpdate),
+                    new WorkflowUpdateOptions
+                    {
+                        Id = cancelOperationId.ToString("D")
+                    });
+
+            var duplicateCancelResult =
+                await successfulHandle
+                    .GetUpdateHandle<CancelOrderUpdateResult>(
+                        cancelOperationId.ToString("D"))
+                    .GetResultAsync();
+
+            Assert.True(cancelResult.Accepted);
+            Assert.Equal(
+                OrderStatus.ReadyForShipment,
+                cancelResult.PreviousStatus);
+            Assert.Equal(
+                OrderStatus.Cancelled,
+                cancelResult.CurrentStatus);
+            Assert.Equal(1, cancelResult.ReleasedReservationCount);
+            Assert.Equal(cancelResult, duplicateCancelResult);
+
+            var successfulResult =
+                await successfulHandle.GetResultAsync();
+
+            Assert.Equal(
+                OrderStatus.Cancelled,
+                successfulResult.Status);
+
             var rejectedResult =
                 await client.ExecuteWorkflowAsync(
                     (OrderWorkflow workflow) =>
@@ -249,7 +287,7 @@ public sealed class OrderWorkflowTemporalIntegrationTests
                             order.OrderId == rejectedOrderId);
 
             Assert.Equal(
-                OrderStatus.ReadyForShipment,
+                OrderStatus.Cancelled,
                 successfulOrder.Status);
 
             Assert.Equal(
@@ -273,15 +311,27 @@ public sealed class OrderWorkflowTemporalIntegrationTests
                             successfulOrderId);
 
             Assert.Equal(
-                FulfillmentStatus.Packed,
+                FulfillmentStatus.Cancelled,
                 fulfillment.Status);
 
             Assert.Equal(
                 packingSignal.EventId,
                 ExtractEventId(fulfillment.OperationKey));
 
+            var reservation =
+                await verificationDbContext.InventoryReservations
+                    .AsNoTracking()
+                    .SingleAsync(current =>
+                        current.OrderItem.OrderId ==
+                        successfulOrderId);
+
             Assert.Equal(
-                7,
+                ReservationStatus.Released,
+                reservation.Status);
+            Assert.NotNull(reservation.ReleasedAtUtc);
+
+            Assert.Equal(
+                8,
                 await verificationDbContext.OrderHistory
                     .CountAsync(
                         entry =>
@@ -322,11 +372,11 @@ public sealed class OrderWorkflowTemporalIntegrationTests
                             stock.ReservedQuantity));
 
             Assert.Equal(
-                stockBefore[2].AvailableQuantity - 1,
+                stockBefore[2].AvailableQuantity,
                 stockAfter[2].AvailableQuantity);
 
             Assert.Equal(
-                stockBefore[2].ReservedQuantity + 1,
+                stockBefore[2].ReservedQuantity,
                 stockAfter[2].ReservedQuantity);
 
             Assert.Equal(stockBefore[1], stockAfter[1]);
@@ -346,8 +396,9 @@ public sealed class OrderWorkflowTemporalIntegrationTests
                             "Limpieza de la prueba de integración.");
                 }
                 catch (RpcException exception)
-                    when (exception.Code ==
-                          RpcException.StatusCode.NotFound)
+                    when (exception.Code is
+                          RpcException.StatusCode.NotFound or
+                          RpcException.StatusCode.FailedPrecondition)
                 {
                     // La ejecución no alcanzó a iniciar o ya no existe.
                 }
