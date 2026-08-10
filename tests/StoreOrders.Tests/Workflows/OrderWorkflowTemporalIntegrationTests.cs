@@ -4,6 +4,8 @@ using StoreOrders.Domain.Enums;
 using StoreOrders.Domain.Operations.Inputs;
 using StoreOrders.Infrastructure.Persistence;
 using StoreOrders.Workflows.Configuration;
+using StoreOrders.Workflows.Deliveries;
+using StoreOrders.Workflows.Deliveries.Contracts;
 using StoreOrders.Workflows.Orders;
 using StoreOrders.Workflows.Orders.Contracts;
 using Temporalio.Client;
@@ -207,16 +209,19 @@ public sealed class OrderWorkflowTemporalIntegrationTests
 
             var readyStatus = await WaitForStageAsync(
                 successfulHandle,
-                OrderWorkflowStage.ReadyForShipment);
+                OrderWorkflowStage.ReadyForShipment,
+                requireDeliveryStarted: true);
 
             Assert.True(readyStatus.PaymentReceived);
             Assert.True(readyStatus.PackingCompleted);
-            Assert.False(readyStatus.DeliveryStarted);
+            Assert.True(readyStatus.DeliveryStarted);
             Assert.True(readyStatus.CanChangeAddress);
             Assert.True(readyStatus.CanCancel);
             Assert.Equal(
                 OrderWorkflowWaitingFor.ShipmentShipped,
                 readyStatus.WaitingFor);
+
+            await WaitForShipmentAsync(successfulOrderId);
 
             var cancelOperationId = Guid.NewGuid();
             var cancelUpdate = new CancelOrderUpdate(
@@ -331,12 +336,23 @@ public sealed class OrderWorkflowTemporalIntegrationTests
             Assert.NotNull(reservation.ReleasedAtUtc);
 
             Assert.Equal(
-                8,
+                9,
                 await verificationDbContext.OrderHistory
                     .CountAsync(
                         entry =>
                             entry.OrderId ==
                             successfulOrderId));
+
+            var cancelledShipment =
+                await verificationDbContext.Shipments
+                    .AsNoTracking()
+                    .SingleAsync(
+                        shipment =>
+                            shipment.OrderId == successfulOrderId);
+
+            Assert.Equal(
+                ShipmentStatus.Cancelled,
+                cancelledShipment.Status);
 
             var updatedAddress =
                 await verificationDbContext.OrderAddresses
@@ -412,9 +428,210 @@ public sealed class OrderWorkflowTemporalIntegrationTests
         }
     }
 
+    [Fact]
+    public async Task OrderWorkflow_CompletesDeliveryThroughChildWorkflow()
+    {
+        var orderId = Guid.NewGuid();
+        Guid[] testOrderIds = [orderId];
+
+        await using (var setupDbContext = CreateDbContext())
+        {
+            await setupDbContext.Database.MigrateAsync();
+            await CleanupAsync(setupDbContext, testOrderIds);
+        }
+
+        ITemporalClient? client = null;
+
+        try
+        {
+            StockSnapshot stockBefore;
+            decimal totalAmount;
+
+            await using (var snapshotDbContext = CreateDbContext())
+            {
+                stockBefore = await snapshotDbContext.InventoryStocks
+                    .AsNoTracking()
+                    .Where(stock => stock.ProductId == 2)
+                    .Select(stock => new StockSnapshot(
+                        stock.AvailableQuantity,
+                        stock.ReservedQuantity))
+                    .SingleAsync();
+
+                totalAmount = await snapshotDbContext.Products
+                    .Where(product => product.ProductId == 2)
+                    .Select(product => product.CurrentPrice)
+                    .SingleAsync();
+            }
+
+            Assert.True(stockBefore.AvailableQuantity >= 1);
+
+            client = await TemporalClient.ConnectAsync(
+                new("localhost:7233")
+                {
+                    Namespace = "default"
+                });
+
+            var handle = await client.StartWorkflowAsync(
+                (OrderWorkflow workflow) =>
+                    workflow.RunAsync(
+                        CreateInput(
+                            orderId,
+                            new[]
+                            {
+                                new CreateOrderItemInput(2, 1)
+                            })),
+                new(
+                    id: TemporalNames.OrderWorkflowId(orderId),
+                    taskQueue: TemporalNames.TaskQueue));
+
+            var packingSignal = new PackingCompletedSignal(
+                Guid.NewGuid(),
+                "warehouse-test-user",
+                DateTime.UtcNow);
+
+            await handle.SignalAsync(
+                workflow =>
+                    workflow.PackingCompletedAsync(packingSignal));
+
+            var paymentSignal = new PaymentConfirmedSignal(
+                Guid.NewGuid(),
+                $"PAY-{Guid.NewGuid():N}",
+                totalAmount,
+                "MXN",
+                DateTime.UtcNow);
+
+            await handle.SignalAsync(
+                workflow =>
+                    workflow.PaymentConfirmedAsync(paymentSignal));
+
+            var readyStatus = await WaitForStageAsync(
+                handle,
+                OrderWorkflowStage.ReadyForShipment,
+                requireDeliveryStarted: true);
+
+            Assert.True(readyStatus.DeliveryStarted);
+            Assert.True(readyStatus.CanChangeAddress);
+            Assert.True(readyStatus.CanCancel);
+
+            await WaitForShipmentAsync(orderId);
+
+            var deliveryHandle =
+                client.GetWorkflowHandle<DeliveryWorkflow>(
+                    TemporalNames.DeliveryWorkflowId(orderId));
+
+            var shippedSignal = new ShipmentShippedSignal(
+                Guid.NewGuid(),
+                "Paquetería Demo",
+                $"TRACK-{Guid.NewGuid():N}",
+                DateTime.UtcNow);
+
+            await deliveryHandle.SignalAsync(
+                workflow =>
+                    workflow.ShipmentShippedAsync(shippedSignal));
+
+            await deliveryHandle.SignalAsync(
+                workflow =>
+                    workflow.ShipmentShippedAsync(shippedSignal));
+
+            var shippedStatus = await WaitForStageAsync(
+                handle,
+                OrderWorkflowStage.Shipped);
+
+            Assert.Equal(
+                OrderWorkflowWaitingFor.ShipmentDelivered,
+                shippedStatus.WaitingFor);
+            Assert.False(shippedStatus.CanChangeAddress);
+            Assert.False(shippedStatus.CanCancel);
+
+            var deliveredSignal = new ShipmentDeliveredSignal(
+                Guid.NewGuid(),
+                DateTime.UtcNow);
+
+            await deliveryHandle.SignalAsync(
+                workflow =>
+                    workflow.ShipmentDeliveredAsync(
+                        deliveredSignal));
+
+            var orderResult = await handle.GetResultAsync();
+
+            var deliveryResult = await client
+                .GetWorkflowHandle(
+                    TemporalNames.DeliveryWorkflowId(orderId))
+                .GetResultAsync<DeliveryWorkflowResult>();
+
+            Assert.Equal(OrderStatus.Delivered, orderResult.Status);
+            Assert.Equal(
+                ShipmentStatus.Delivered,
+                deliveryResult.Status);
+
+            await using var verificationDbContext =
+                CreateDbContext();
+
+            var order = await verificationDbContext.Orders
+                .AsNoTracking()
+                .SingleAsync(current => current.OrderId == orderId);
+
+            var shipment = await verificationDbContext.Shipments
+                .AsNoTracking()
+                .SingleAsync(current => current.OrderId == orderId);
+
+            var reservation =
+                await verificationDbContext.InventoryReservations
+                    .AsNoTracking()
+                    .SingleAsync(current =>
+                        current.OrderItem.OrderId == orderId);
+
+            var stockAfter =
+                await verificationDbContext.InventoryStocks
+                    .AsNoTracking()
+                    .Where(stock => stock.ProductId == 2)
+                    .Select(stock => new StockSnapshot(
+                        stock.AvailableQuantity,
+                        stock.ReservedQuantity))
+                    .SingleAsync();
+
+            Assert.Equal(OrderStatus.Delivered, order.Status);
+            Assert.Equal(ShipmentStatus.Delivered, shipment.Status);
+            Assert.Equal(
+                ReservationStatus.Consumed,
+                reservation.Status);
+            Assert.Equal(
+                stockBefore.AvailableQuantity - 1,
+                stockAfter.AvailableQuantity);
+            Assert.Equal(
+                stockBefore.ReservedQuantity,
+                stockAfter.ReservedQuantity);
+        }
+        finally
+        {
+            if (client is not null)
+            {
+                try
+                {
+                    await client
+                        .GetWorkflowHandle(
+                            TemporalNames.OrderWorkflowId(orderId))
+                        .TerminateAsync(
+                            "Limpieza de la prueba de entrega.");
+                }
+                catch (RpcException exception)
+                    when (exception.Code is
+                          RpcException.StatusCode.NotFound or
+                          RpcException.StatusCode.FailedPrecondition)
+                {
+                    // La ejecución ya terminó o no alcanzó a iniciar.
+                }
+            }
+
+            await using var cleanupDbContext = CreateDbContext();
+            await CleanupAsync(cleanupDbContext, testOrderIds);
+        }
+    }
+
     private static async Task<OrderRuntimeStatus> WaitForStageAsync(
         WorkflowHandle<OrderWorkflow, OrderWorkflowResult> handle,
-        OrderWorkflowStage expectedStage)
+        OrderWorkflowStage expectedStage,
+        bool requireDeliveryStarted = false)
     {
         var deadline = DateTime.UtcNow.AddSeconds(30);
 
@@ -423,7 +640,9 @@ public sealed class OrderWorkflowTemporalIntegrationTests
             var status = await handle.QueryAsync(
                 workflow => workflow.GetRuntimeStatus());
 
-            if (status.Stage == expectedStage)
+            if (status.Stage == expectedStage &&
+                (!requireDeliveryStarted ||
+                 status.DeliveryStarted))
             {
                 return status;
             }
@@ -433,6 +652,30 @@ public sealed class OrderWorkflowTemporalIntegrationTests
 
         throw new TimeoutException(
             $"El Workflow no alcanzó la etapa {expectedStage}.");
+    }
+
+    private static async Task WaitForShipmentAsync(Guid orderId)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(30);
+
+        while (DateTime.UtcNow < deadline)
+        {
+            await using var dbContext = CreateDbContext();
+
+            if (await dbContext.Shipments
+                    .AsNoTracking()
+                    .AnyAsync(
+                        shipment =>
+                            shipment.OrderId == orderId))
+            {
+                return;
+            }
+
+            await Task.Delay(200);
+        }
+
+        throw new TimeoutException(
+            "El Child Workflow no creó el envío pendiente.");
     }
 
     private static async Task WaitForHistoryAsync(
@@ -529,43 +772,64 @@ public sealed class OrderWorkflowTemporalIntegrationTests
         StoreOrdersDbContext dbContext,
         Guid[] orderIds)
     {
-        var activeReservations =
+        var reservations =
             await dbContext.InventoryReservations
                 .Where(reservation =>
                     orderIds.Contains(
-                        reservation.OrderItem.OrderId) &&
-                    reservation.Status ==
-                        ReservationStatus.Active)
+                        reservation.OrderItem.OrderId))
                 .Select(reservation => new
                 {
                     reservation.OrderItem.ProductId,
-                    reservation.Quantity
+                    reservation.Quantity,
+                    reservation.Status
                 })
                 .ToListAsync();
 
-        foreach (var reservation in activeReservations)
+        foreach (var reservation in reservations)
         {
-            await dbContext.InventoryStocks
-                .Where(stock =>
-                    stock.ProductId ==
-                    reservation.ProductId)
-                .ExecuteUpdateAsync(
-                    setters => setters
-                        .SetProperty(
-                            stock =>
-                                stock.AvailableQuantity,
-                            stock =>
-                                stock.AvailableQuantity +
-                                reservation.Quantity)
-                        .SetProperty(
-                            stock =>
-                                stock.ReservedQuantity,
-                            stock =>
-                                stock.ReservedQuantity -
-                                reservation.Quantity)
-                        .SetProperty(
-                            stock => stock.UpdatedAtUtc,
-                            DateTime.UtcNow));
+            if (reservation.Status == ReservationStatus.Active)
+            {
+                await dbContext.InventoryStocks
+                    .Where(stock =>
+                        stock.ProductId ==
+                        reservation.ProductId)
+                    .ExecuteUpdateAsync(
+                        setters => setters
+                            .SetProperty(
+                                stock =>
+                                    stock.AvailableQuantity,
+                                stock =>
+                                    stock.AvailableQuantity +
+                                    reservation.Quantity)
+                            .SetProperty(
+                                stock =>
+                                    stock.ReservedQuantity,
+                                stock =>
+                                    stock.ReservedQuantity -
+                                    reservation.Quantity)
+                            .SetProperty(
+                                stock => stock.UpdatedAtUtc,
+                                DateTime.UtcNow));
+            }
+            else if (reservation.Status ==
+                     ReservationStatus.Consumed)
+            {
+                await dbContext.InventoryStocks
+                    .Where(stock =>
+                        stock.ProductId ==
+                        reservation.ProductId)
+                    .ExecuteUpdateAsync(
+                        setters => setters
+                            .SetProperty(
+                                stock =>
+                                    stock.AvailableQuantity,
+                                stock =>
+                                    stock.AvailableQuantity +
+                                    reservation.Quantity)
+                            .SetProperty(
+                                stock => stock.UpdatedAtUtc,
+                                DateTime.UtcNow));
+            }
         }
 
         await dbContext.Payments
@@ -576,6 +840,11 @@ public sealed class OrderWorkflowTemporalIntegrationTests
         await dbContext.OrderFulfillments
             .Where(fulfillment =>
                 orderIds.Contains(fulfillment.OrderId))
+            .ExecuteDeleteAsync();
+
+        await dbContext.Shipments
+            .Where(shipment =>
+                orderIds.Contains(shipment.OrderId))
             .ExecuteDeleteAsync();
 
         await dbContext.InventoryReservations

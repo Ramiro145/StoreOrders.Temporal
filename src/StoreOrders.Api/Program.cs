@@ -48,6 +48,10 @@ builder.Services.AddScoped<
     IOrderWorkflowGateway,
     TemporalOrderWorkflowGateway>();
 
+builder.Services.AddScoped<
+    IDeliveryWorkflowGateway,
+    TemporalDeliveryWorkflowGateway>();
+
 var app = builder.Build();
 
 if (app.Environment.IsDevelopment())

@@ -3,6 +3,8 @@ using StoreOrders.Domain.Operations.Inputs;
 using StoreOrders.Domain.Operations.Results;
 using StoreOrders.Workflows.Activities;
 using StoreOrders.Workflows.Configuration;
+using StoreOrders.Workflows.Deliveries;
+using StoreOrders.Workflows.Deliveries.Contracts;
 using StoreOrders.Workflows.Orders.Contracts;
 using Temporalio.Workflows;
 
@@ -14,6 +16,9 @@ public sealed class OrderWorkflow
     private const string WaitForPaymentPatch =
         "order-wait-for-payment-v1";
 
+    private const string DeliveryChildWorkflowPatch =
+        "order-delivery-child-v1";
+
     private readonly Guid orderId;
     private readonly string workflowId;
     private readonly Queue<PaymentConfirmedSignal> pendingPayments = [];
@@ -21,6 +26,10 @@ public sealed class OrderWorkflow
     private readonly HashSet<Guid> receivedPaymentEventIds = [];
     private readonly HashSet<Guid> receivedPackingEventIds = [];
     private readonly Temporalio.Workflows.Mutex mutationMutex = new();
+
+    private ChildWorkflowHandle<
+        DeliveryWorkflow,
+        DeliveryWorkflowResult>? deliveryHandle;
 
     private OrderWorkflowStage stage =
         OrderWorkflowStage.Initializing;
@@ -152,8 +161,42 @@ public sealed class OrderWorkflow
             return await CompleteTerminalResultAsync();
         }
 
-        // El Incremento 11 sustituirá esta espera por DeliveryWorkflow.
-        await Workflow.WaitConditionAsync(() => isTerminal);
+        // Mantiene compatibles los historiales creados antes de que
+        // existiera el Child Workflow de entrega.
+        if (!Workflow.Patched(DeliveryChildWorkflowPatch))
+        {
+            await Workflow.WaitConditionAsync(() => isTerminal);
+            return await CompleteTerminalResultAsync();
+        }
+
+        await StartDeliveryAsync();
+
+        if (isTerminal && deliveryHandle is null)
+        {
+            return await CompleteTerminalResultAsync();
+        }
+
+        var deliveryResult = await deliveryHandle!.GetResultAsync();
+
+        if (deliveryResult.Status == ShipmentStatus.Delivered)
+        {
+            stage = OrderWorkflowStage.Delivered;
+            waitingFor = OrderWorkflowWaitingFor.None;
+            isTerminal = true;
+        }
+        else if (deliveryResult.Status == ShipmentStatus.Cancelled)
+        {
+            stage = OrderWorkflowStage.Cancelled;
+            waitingFor = OrderWorkflowWaitingFor.None;
+            isTerminal = true;
+        }
+        else
+        {
+            throw new InvalidOperationException(
+                $"Resultado de entrega desconocido: " +
+                $"{deliveryResult.Status}.");
+        }
+
         return await CompleteTerminalResultAsync();
     }
 
@@ -203,6 +246,34 @@ public sealed class OrderWorkflow
             receivedPackingEventIds.Add(signal.EventId))
         {
             pendingPacking.Enqueue(signal);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    [WorkflowSignal(TemporalNames.DeliveryProgressChangedSignal)]
+    public Task DeliveryProgressChangedAsync(
+        DeliveryProgressSignal signal)
+    {
+        if (signal.OrderId != orderId ||
+            isTerminal)
+        {
+            return Task.CompletedTask;
+        }
+
+        deliveryStarted = true;
+
+        if (signal.Status == ShipmentStatus.Shipped)
+        {
+            stage = OrderWorkflowStage.Shipped;
+            waitingFor =
+                OrderWorkflowWaitingFor.ShipmentDelivered;
+        }
+        else if (signal.Status == ShipmentStatus.Delivered)
+        {
+            stage = OrderWorkflowStage.Delivered;
+            waitingFor = OrderWorkflowWaitingFor.None;
+            isTerminal = true;
         }
 
         return Task.CompletedTask;
@@ -323,6 +394,16 @@ public sealed class OrderWorkflow
                 stage = OrderWorkflowStage.Cancelled;
                 waitingFor = OrderWorkflowWaitingFor.None;
                 isTerminal = true;
+
+                if (deliveryHandle is not null &&
+                    result.PreviousStatus !=
+                        OrderStatus.Cancelled)
+                {
+                    await deliveryHandle.SignalAsync(
+                        workflow => workflow.CancelDeliveryAsync(
+                            new CancelDeliverySignal(
+                                update.OperationId)));
+                }
             }
 
             return new CancelOrderUpdateResult(
@@ -508,6 +589,50 @@ public sealed class OrderWorkflow
         }
     }
 
+    private async Task StartDeliveryAsync()
+    {
+        await mutationMutex.WaitOneAsync();
+
+        try
+        {
+            if (isTerminal)
+            {
+                return;
+            }
+
+            var deliveryWorkflowId =
+                TemporalNames.DeliveryWorkflowId(orderId);
+
+            deliveryHandle = await Workflow.StartChildWorkflowAsync(
+                (DeliveryWorkflow workflow) =>
+                    workflow.RunAsync(
+                        new StartDeliveryInput(
+                            orderId,
+                            workflowId,
+                            deliveryWorkflowId)),
+                new ChildWorkflowOptions
+                {
+                    Id = deliveryWorkflowId,
+                    TaskQueue = TemporalNames.TaskQueue
+                });
+
+            deliveryStarted = true;
+
+            if (stage is not
+                (OrderWorkflowStage.Shipped or
+                 OrderWorkflowStage.Delivered))
+            {
+                stage = OrderWorkflowStage.ReadyForShipment;
+                waitingFor =
+                    OrderWorkflowWaitingFor.ShipmentShipped;
+            }
+        }
+        finally
+        {
+            mutationMutex.ReleaseMutex();
+        }
+    }
+
     private async Task<OrderWorkflowResult>
         CompleteTerminalResultAsync()
     {
@@ -521,7 +646,7 @@ public sealed class OrderWorkflow
                 ? "El pedido fue cancelado."
                 : stage == OrderWorkflowStage.Rejected
                     ? "Pedido rechazado por inventario insuficiente."
-                    : "El proceso del pedido terminó.");
+                    : "El pedido fue entregado.");
     }
 
     private OrderStatus ToTerminalOrderStatus()

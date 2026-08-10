@@ -32,4 +32,16 @@ public interface IOrderOperations
     Task<CancelOrderResult> CancelOrderAsync(
         CancelOrderInput input,
         CancellationToken cancellationToken = default);
+
+    Task<CreateShipmentResult> CreateShipmentAsync(
+        CreateShipmentInput input,
+        CancellationToken cancellationToken = default);
+
+    Task<MarkShipmentShippedResult> MarkShipmentShippedAsync(
+        MarkShipmentShippedInput input,
+        CancellationToken cancellationToken = default);
+
+    Task<MarkShipmentDeliveredResult> MarkShipmentDeliveredAsync(
+        MarkShipmentDeliveredInput input,
+        CancellationToken cancellationToken = default);
 }

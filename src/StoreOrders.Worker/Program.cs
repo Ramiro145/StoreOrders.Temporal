@@ -5,6 +5,7 @@ using StoreOrders.Infrastructure;
 using StoreOrders.Worker.Options;
 using StoreOrders.Workflows.Activities;
 using StoreOrders.Workflows.Configuration;
+using StoreOrders.Workflows.Deliveries;
 using StoreOrders.Workflows.Orders;
 using Temporalio.Extensions.Hosting;
 
@@ -51,6 +52,7 @@ builder.Services
         temporalOptions.Namespace,
         temporalOptions.TaskQueue)
     .AddScopedActivities<OrderActivities>()
+    .AddWorkflow<DeliveryWorkflow>()
     .AddWorkflow<OrderWorkflow>();
 
 var host = builder.Build();

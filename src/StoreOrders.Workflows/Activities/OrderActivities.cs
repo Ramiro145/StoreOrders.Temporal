@@ -71,4 +71,33 @@ public sealed class OrderActivities(
             input,
             ActivityExecutionContext.Current.CancellationToken);
     }
+
+    [Activity]
+    public async Task<CreateShipmentResult> CreateShipmentAsync(
+        CreateShipmentInput input)
+    {
+        return await orderOperations.CreateShipmentAsync(
+            input,
+            ActivityExecutionContext.Current.CancellationToken);
+    }
+
+    [Activity]
+    public async Task<MarkShipmentShippedResult>
+        MarkShipmentShippedAsync(
+            MarkShipmentShippedInput input)
+    {
+        return await orderOperations.MarkShipmentShippedAsync(
+            input,
+            ActivityExecutionContext.Current.CancellationToken);
+    }
+
+    [Activity]
+    public async Task<MarkShipmentDeliveredResult>
+        MarkShipmentDeliveredAsync(
+            MarkShipmentDeliveredInput input)
+    {
+        return await orderOperations.MarkShipmentDeliveredAsync(
+            input,
+            ActivityExecutionContext.Current.CancellationToken);
+    }
 }

@@ -69,6 +69,57 @@ public sealed class EfOrderReadService(
                 item.LineTotal))
             .ToArrayAsync(cancellationToken);
 
+        var payment = await dbContext.Payments
+            .AsNoTracking()
+            .Where(current => current.OrderId == orderId)
+            .Select(current => new OrderPaymentReadModel(
+                current.ExternalPaymentReference,
+                current.Amount,
+                current.Currency,
+                current.Status,
+                current.ConfirmedAtUtc))
+            .SingleOrDefaultAsync(cancellationToken);
+
+        var fulfillmentData = await dbContext.OrderFulfillments
+            .AsNoTracking()
+            .Where(current => current.OrderId == orderId)
+            .Select(current => new
+            {
+                current.Status,
+                current.PackedBy,
+                current.PackedAtUtc
+            })
+            .SingleOrDefaultAsync(cancellationToken);
+
+        var fulfillment = fulfillmentData is null
+            ? null
+            : new OrderFulfillmentReadModel(
+                fulfillmentData.Status.ToString(),
+                fulfillmentData.PackedBy,
+                fulfillmentData.PackedAtUtc);
+
+        var shipmentData = await dbContext.Shipments
+            .AsNoTracking()
+            .Where(current => current.OrderId == orderId)
+            .Select(current => new
+            {
+                current.Status,
+                current.Carrier,
+                current.TrackingNumber,
+                current.ShippedAtUtc,
+                current.DeliveredAtUtc
+            })
+            .SingleOrDefaultAsync(cancellationToken);
+
+        var shipment = shipmentData is null
+            ? null
+            : new OrderShipmentReadModel(
+                shipmentData.Status.ToString(),
+                shipmentData.Carrier,
+                shipmentData.TrackingNumber,
+                shipmentData.ShippedAtUtc,
+                shipmentData.DeliveredAtUtc);
+
         return new OrderReadModel(
             order.OrderId,
             order.OrderNumber,
@@ -79,9 +130,9 @@ public sealed class EfOrderReadService(
             order.TotalAmount,
             address,
             items,
-            Payment: null,
-            Fulfillment: null,
-            Shipment: null,
+            payment,
+            fulfillment,
+            shipment,
             order.CreatedAtUtc,
             order.UpdatedAtUtc);
     }

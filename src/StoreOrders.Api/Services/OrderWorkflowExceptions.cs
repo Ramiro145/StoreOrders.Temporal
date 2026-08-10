@@ -14,3 +14,13 @@ public sealed class OrderWorkflowNotFoundException(
     string message,
     Exception innerException)
     : Exception(message, innerException);
+
+public sealed class DeliveryWorkflowNotReadyException(
+    string message,
+    Exception innerException)
+    : Exception(message, innerException);
+
+public sealed class DeliveryWorkflowUnavailableException(
+    string message,
+    Exception innerException)
+    : Exception(message, innerException);

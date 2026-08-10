@@ -19,6 +19,18 @@ public static class TemporalNames
     public const string CancelOrderUpdate =
         "CancelOrder";
 
+    public const string ShipmentShippedSignal =
+        "ShipmentShipped";
+
+    public const string ShipmentDeliveredSignal =
+        "ShipmentDelivered";
+
+    public const string DeliveryProgressChangedSignal =
+        "DeliveryProgressChanged";
+
+    public const string CancelDeliverySignal =
+        "CancelDelivery";
+
     public static string OrderWorkflowId(Guid orderId)
     {
         if (orderId == Guid.Empty)

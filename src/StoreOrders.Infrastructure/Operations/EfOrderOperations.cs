@@ -1009,6 +1009,502 @@ public sealed class EfOrderOperations(
             "El pedido fue cancelado y sus reservaciones fueron liberadas.");
     }
 
+    public async Task<CreateShipmentResult> CreateShipmentAsync(
+        CreateShipmentInput input,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateShipmentCreationInput(input);
+
+        await using var transaction =
+            await dbContext.Database.BeginTransactionAsync(
+                System.Data.IsolationLevel.Serializable,
+                cancellationToken);
+
+        var order = await dbContext.Orders
+            .Include(current => current.Shipment)
+            .SingleOrDefaultAsync(
+                current => current.OrderId == input.OrderId,
+                cancellationToken)
+            ?? throw new InvalidOperationException(
+                $"No existe el pedido {input.OrderId:D}.");
+
+        var deliveryWorkflowId = input.DeliveryWorkflowId.Trim();
+
+        if (order.Shipment is not null)
+        {
+            if (!string.Equals(
+                    order.Shipment.DeliveryWorkflowId,
+                    deliveryWorkflowId,
+                    StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "El pedido ya pertenece a otro Workflow de entrega.");
+            }
+
+            await transaction.CommitAsync(cancellationToken);
+
+            return new CreateShipmentResult(
+                order.OrderId,
+                order.Status,
+                order.Shipment.Status,
+                CreateShipmentOutcome.AlreadyExists);
+        }
+
+        if (order.Status != OrderStatus.ReadyForShipment)
+        {
+            await transaction.CommitAsync(cancellationToken);
+
+            return new CreateShipmentResult(
+                order.OrderId,
+                order.Status,
+                ShipmentStatus: null,
+                CreateShipmentOutcome.OrderNotReady);
+        }
+
+        var nowUtc = DateTime.UtcNow;
+
+        var shipment = new Shipment
+        {
+            ShipmentId = Guid.NewGuid(),
+            OrderId = order.OrderId,
+            DeliveryWorkflowId = deliveryWorkflowId,
+            Status = ShipmentStatus.Pending,
+            CreatedAtUtc = nowUtc,
+            Order = order
+        };
+
+        order.Shipment = shipment;
+        dbContext.Shipments.Add(shipment);
+
+        dbContext.OrderHistory.Add(new OrderHistoryEntry
+        {
+            OrderId = order.OrderId,
+            EventType = "ShipmentCreated",
+            PreviousStatus = order.Status,
+            CurrentStatus = order.Status,
+            ActorType = ActorType.System,
+            Description = "Se creó el proceso de entrega pendiente.",
+            OperationKey =
+                $"order:{order.OrderId:D}:shipment:create",
+            OccurredAtUtc = nowUtc,
+            Order = order
+        });
+
+        await dbContext.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+
+        return new CreateShipmentResult(
+            order.OrderId,
+            order.Status,
+            shipment.Status,
+            CreateShipmentOutcome.Created);
+    }
+
+    public async Task<MarkShipmentShippedResult>
+        MarkShipmentShippedAsync(
+            MarkShipmentShippedInput input,
+            CancellationToken cancellationToken = default)
+    {
+        ValidateShipmentShippedInput(input);
+
+        var operationKey =
+            $"order:{input.OrderId:D}:shipment:shipped:" +
+            $"{input.EventId:D}";
+
+        var carrier = input.Carrier.Trim();
+        var trackingNumber = input.TrackingNumber.Trim();
+        var shippedAtUtc = NormalizeUtcToMilliseconds(
+            input.ShippedAtUtc);
+
+        await using var transaction =
+            await dbContext.Database.BeginTransactionAsync(
+                System.Data.IsolationLevel.Serializable,
+                cancellationToken);
+
+        var order = await dbContext.Orders
+            .Include(current => current.Shipment)
+            .SingleOrDefaultAsync(
+                current => current.OrderId == input.OrderId,
+                cancellationToken)
+            ?? throw new InvalidOperationException(
+                $"No existe el pedido {input.OrderId:D}.");
+
+        var shipment = order.Shipment
+            ?? throw new InvalidOperationException(
+                "El pedido no contiene un envío pendiente.");
+
+        var previousAttempt = await dbContext.OrderHistory
+            .AsNoTracking()
+            .SingleOrDefaultAsync(
+                entry => entry.OperationKey == operationKey,
+                cancellationToken);
+
+        if (previousAttempt is not null)
+        {
+            if (previousAttempt.EventType != "ShipmentShipped" ||
+                !ShipmentMatches(
+                    shipment,
+                    carrier,
+                    trackingNumber,
+                    shippedAtUtc))
+            {
+                throw new InvalidOperationException(
+                    "EventId ya fue utilizado para otro aviso de envío.");
+            }
+
+            await transaction.CommitAsync(cancellationToken);
+
+            return new MarkShipmentShippedResult(
+                order.OrderId,
+                order.Status,
+                shipment.Status,
+                MarkShipmentShippedOutcome.AlreadyShipped);
+        }
+
+        if (shipment.Status is
+                ShipmentStatus.Shipped or
+                ShipmentStatus.Delivered)
+        {
+            await transaction.CommitAsync(cancellationToken);
+
+            return new MarkShipmentShippedResult(
+                order.OrderId,
+                order.Status,
+                shipment.Status,
+                MarkShipmentShippedOutcome.AlreadyShipped);
+        }
+
+        if (order.Status != OrderStatus.ReadyForShipment ||
+            shipment.Status != ShipmentStatus.Pending)
+        {
+            await transaction.CommitAsync(cancellationToken);
+
+            return new MarkShipmentShippedResult(
+                order.OrderId,
+                order.Status,
+                shipment.Status,
+                MarkShipmentShippedOutcome.OrderNotReady);
+        }
+
+        var trackingNumberInUse = await dbContext.Shipments
+            .AsNoTracking()
+            .AnyAsync(
+                current =>
+                    current.OrderId != order.OrderId &&
+                    current.TrackingNumber == trackingNumber,
+                cancellationToken);
+
+        if (trackingNumberInUse)
+        {
+            await transaction.CommitAsync(cancellationToken);
+
+            return new MarkShipmentShippedResult(
+                order.OrderId,
+                order.Status,
+                shipment.Status,
+                MarkShipmentShippedOutcome.TrackingNumberInUse);
+        }
+
+        var activeReservations =
+            await dbContext.InventoryReservations
+                .Include(reservation => reservation.OrderItem)
+                .Where(reservation =>
+                    reservation.OrderItem.OrderId == order.OrderId &&
+                    reservation.Status == ReservationStatus.Active)
+                .ToArrayAsync(cancellationToken);
+
+        if (activeReservations.Length == 0)
+        {
+            throw new InvalidOperationException(
+                "El pedido no contiene reservaciones activas para consumir.");
+        }
+
+        var nowUtc = DateTime.UtcNow;
+
+        foreach (var productReservations in activeReservations
+                     .GroupBy(reservation =>
+                         reservation.OrderItem.ProductId))
+        {
+            var quantity = productReservations.Sum(
+                reservation => reservation.Quantity);
+
+            var affectedStocks = await dbContext.InventoryStocks
+                .Where(stock =>
+                    stock.ProductId == productReservations.Key &&
+                    stock.ReservedQuantity >= quantity)
+                .ExecuteUpdateAsync(
+                    setters => setters
+                        .SetProperty(
+                            stock => stock.ReservedQuantity,
+                            stock =>
+                                stock.ReservedQuantity - quantity)
+                        .SetProperty(
+                            stock => stock.UpdatedAtUtc,
+                            nowUtc),
+                    cancellationToken);
+
+            if (affectedStocks != 1)
+            {
+                throw new InvalidOperationException(
+                    "El inventario reservado es incompatible con " +
+                    $"el producto {productReservations.Key}.");
+            }
+        }
+
+        foreach (var reservation in activeReservations)
+        {
+            reservation.Status = ReservationStatus.Consumed;
+            reservation.ConsumedAtUtc = nowUtc;
+        }
+
+        shipment.Carrier = carrier;
+        shipment.TrackingNumber = trackingNumber;
+        shipment.Status = ShipmentStatus.Shipped;
+        shipment.ShippedAtUtc = shippedAtUtc;
+
+        order.Status = OrderStatus.Shipped;
+        order.UpdatedAtUtc = nowUtc;
+
+        dbContext.OrderHistory.Add(new OrderHistoryEntry
+        {
+            OrderId = order.OrderId,
+            EventType = "ShipmentShipped",
+            PreviousStatus = OrderStatus.ReadyForShipment,
+            CurrentStatus = OrderStatus.Shipped,
+            ActorType = ActorType.DeliveryService,
+            Description =
+                $"El paquete salió con la guía {trackingNumber}.",
+            OperationKey = operationKey,
+            OccurredAtUtc = nowUtc,
+            Order = order
+        });
+
+        await dbContext.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+
+        return new MarkShipmentShippedResult(
+            order.OrderId,
+            order.Status,
+            shipment.Status,
+            MarkShipmentShippedOutcome.Shipped);
+    }
+
+    public async Task<MarkShipmentDeliveredResult>
+        MarkShipmentDeliveredAsync(
+            MarkShipmentDeliveredInput input,
+            CancellationToken cancellationToken = default)
+    {
+        ValidateShipmentDeliveredInput(input);
+
+        var operationKey =
+            $"order:{input.OrderId:D}:shipment:delivered:" +
+            $"{input.EventId:D}";
+
+        var deliveredAtUtc = NormalizeUtcToMilliseconds(
+            input.DeliveredAtUtc);
+
+        await using var transaction =
+            await dbContext.Database.BeginTransactionAsync(
+                System.Data.IsolationLevel.Serializable,
+                cancellationToken);
+
+        var order = await dbContext.Orders
+            .Include(current => current.Shipment)
+            .SingleOrDefaultAsync(
+                current => current.OrderId == input.OrderId,
+                cancellationToken)
+            ?? throw new InvalidOperationException(
+                $"No existe el pedido {input.OrderId:D}.");
+
+        var shipment = order.Shipment
+            ?? throw new InvalidOperationException(
+                "El pedido no contiene un envío.");
+
+        var previousAttempt = await dbContext.OrderHistory
+            .AsNoTracking()
+            .SingleOrDefaultAsync(
+                entry => entry.OperationKey == operationKey,
+                cancellationToken);
+
+        if (previousAttempt is not null)
+        {
+            if (previousAttempt.EventType != "ShipmentDelivered" ||
+                shipment.DeliveredAtUtc != deliveredAtUtc)
+            {
+                throw new InvalidOperationException(
+                    "EventId ya fue utilizado para otro aviso de entrega.");
+            }
+
+            await transaction.CommitAsync(cancellationToken);
+
+            return new MarkShipmentDeliveredResult(
+                order.OrderId,
+                order.Status,
+                shipment.Status,
+                MarkShipmentDeliveredOutcome.AlreadyDelivered);
+        }
+
+        if (shipment.Status == ShipmentStatus.Delivered)
+        {
+            await transaction.CommitAsync(cancellationToken);
+
+            return new MarkShipmentDeliveredResult(
+                order.OrderId,
+                order.Status,
+                shipment.Status,
+                MarkShipmentDeliveredOutcome.AlreadyDelivered);
+        }
+
+        if (order.Status != OrderStatus.Shipped ||
+            shipment.Status != ShipmentStatus.Shipped)
+        {
+            await transaction.CommitAsync(cancellationToken);
+
+            return new MarkShipmentDeliveredResult(
+                order.OrderId,
+                order.Status,
+                shipment.Status,
+                MarkShipmentDeliveredOutcome.OrderNotReady);
+        }
+
+        var nowUtc = DateTime.UtcNow;
+
+        shipment.Status = ShipmentStatus.Delivered;
+        shipment.DeliveredAtUtc = deliveredAtUtc;
+
+        order.Status = OrderStatus.Delivered;
+        order.DeliveredAtUtc = deliveredAtUtc;
+        order.UpdatedAtUtc = nowUtc;
+
+        dbContext.OrderHistory.Add(new OrderHistoryEntry
+        {
+            OrderId = order.OrderId,
+            EventType = "ShipmentDelivered",
+            PreviousStatus = OrderStatus.Shipped,
+            CurrentStatus = OrderStatus.Delivered,
+            ActorType = ActorType.DeliveryService,
+            Description = "El servicio de entrega confirmó la recepción.",
+            OperationKey = operationKey,
+            OccurredAtUtc = nowUtc,
+            Order = order
+        });
+
+        await dbContext.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+
+        return new MarkShipmentDeliveredResult(
+            order.OrderId,
+            order.Status,
+            shipment.Status,
+            MarkShipmentDeliveredOutcome.Delivered);
+    }
+
+    private static void ValidateShipmentCreationInput(
+        CreateShipmentInput input)
+    {
+        if (input.OrderId == Guid.Empty)
+        {
+            throw new ArgumentException(
+                "OrderId no puede ser un GUID vacío.",
+                nameof(input));
+        }
+
+        if (string.IsNullOrWhiteSpace(input.DeliveryWorkflowId) ||
+            input.DeliveryWorkflowId.Length > 200)
+        {
+            throw new ArgumentException(
+                "DeliveryWorkflowId es obligatorio y no puede " +
+                "exceder 200 caracteres.",
+                nameof(input));
+        }
+    }
+
+    private static void ValidateShipmentShippedInput(
+        MarkShipmentShippedInput input)
+    {
+        if (input.OrderId == Guid.Empty ||
+            input.EventId == Guid.Empty)
+        {
+            throw new ArgumentException(
+                "OrderId y EventId deben contener GUID válidos.",
+                nameof(input));
+        }
+
+        if (string.IsNullOrWhiteSpace(input.Carrier) ||
+            input.Carrier.Length > 100)
+        {
+            throw new ArgumentException(
+                "Carrier es obligatorio y no puede exceder " +
+                "100 caracteres.",
+                nameof(input));
+        }
+
+        if (string.IsNullOrWhiteSpace(input.TrackingNumber) ||
+            input.TrackingNumber.Length > 100)
+        {
+            throw new ArgumentException(
+                "TrackingNumber es obligatorio y no puede exceder " +
+                "100 caracteres.",
+                nameof(input));
+        }
+
+        if (input.ShippedAtUtc == default)
+        {
+            throw new ArgumentException(
+                "ShippedAtUtc es obligatorio.",
+                nameof(input));
+        }
+    }
+
+    private static void ValidateShipmentDeliveredInput(
+        MarkShipmentDeliveredInput input)
+    {
+        if (input.OrderId == Guid.Empty ||
+            input.EventId == Guid.Empty)
+        {
+            throw new ArgumentException(
+                "OrderId y EventId deben contener GUID válidos.",
+                nameof(input));
+        }
+
+        if (input.DeliveredAtUtc == default)
+        {
+            throw new ArgumentException(
+                "DeliveredAtUtc es obligatorio.",
+                nameof(input));
+        }
+    }
+
+    private static bool ShipmentMatches(
+        Shipment shipment,
+        string carrier,
+        string trackingNumber,
+        DateTime shippedAtUtc)
+    {
+        return string.Equals(
+                   shipment.Carrier,
+                   carrier,
+                   StringComparison.Ordinal) &&
+               string.Equals(
+                   shipment.TrackingNumber,
+                   trackingNumber,
+                   StringComparison.OrdinalIgnoreCase) &&
+               shipment.ShippedAtUtc == shippedAtUtc;
+    }
+
+    private static DateTime NormalizeUtcToMilliseconds(DateTime value)
+    {
+        var utcValue = value.Kind == DateTimeKind.Utc
+            ? value
+            : value.ToUniversalTime();
+
+        var ticks =
+            utcValue.Ticks -
+            utcValue.Ticks % TimeSpan.TicksPerMillisecond;
+
+        return new DateTime(ticks, DateTimeKind.Utc);
+    }
+
     private static void ValidateInput(CreateOrderInput input)
     {
         if (input.OrderId == Guid.Empty)
